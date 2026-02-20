@@ -3,31 +3,31 @@ import http.server
 import sys
 import webbrowser
 
-# 1. Railway'in dinamik portunu al (Bulamazsa 8000 yap)
+# 1. Railway'in dinamik portunu al (Bulamazsa varsayılan 8000)
 PORT = int(os.environ.get("PORT", 8000))
 
-# 2. Sunucuda olmayan tarayıcıyı açma komutunu etkisiz hale getir
+# 2. Sunucuda olmayan tarayıcıyı açma komutunu iptal et (Hata vermemesi için)
 webbrowser.open = lambda x: None 
 
-# 3. KODU DEĞİŞTİRMEDEN 'localhost' ENGELİNİ AŞMA (YAMA)
-# trading_bot.py içindeki HTTPServer çağrısını yakalayıp 0.0.0.0'a zorlar
+# 3. KODU DEĞİŞTİRMEDEN 'localhost' ENGELİNİ AŞAN YAMA
 class RailwayServer(http.server.HTTPServer):
     def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
-        # Orijinal kod ne gönderirse göndersin (localhost, 8000 gibi)
-        # biz onu Railway'in dışa açık adresi ve portuyla değiştiriyoruz
+        # Orijinal kod ('localhost', 8000) gönderse bile biz onu 
+        # ('0.0.0.0', PORT) yaparak dış dünyaya açıyoruz.
         super().__init__(('0.0.0.0', PORT), RequestHandlerClass, bind_and_activate)
 
-# Orijinal kütüphaneyi bizim yama ile değiştiriyoruz
+# Python'ın kendi kütüphanesini bizim yamalı versiyonumuzla değiştiriyoruz
 http.server.HTTPServer = RailwayServer
 
-# 4. Orijinal botu çalıştır
+# 4. Orijinal dosyanı şimdi içe aktarabiliriz
 try:
     import trading_bot
 except Exception as e:
-    print(f"Hata oluştu: {e}")
+    print(f"Hata: trading_bot.py yüklenirken sorun oluştu: {e}")
     sys.exit(1)
 
 if __name__ == '__main__':
-    print(f"--- BOT BAŞLATILDI ---")
-    print(f"Railway Portu: {PORT} üzerinden yayın yapılıyor.")
+    print(f"--- WEB ARAYÜZÜ HAZIRLANIYOR ---")
+    print(f"Sunucu adresi: 0.0.0.0:{PORT}")
+    # Senin orijinal main() fonksiyonunu tetikliyoruz
     trading_bot.main()
