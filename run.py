@@ -1,34 +1,32 @@
 import os
 import http.server
 import sys
-import threading
-import time
+import webbrowser
 
-# 1. Railway Port Ayarı
+# 1. Railway'in dinamik portunu al, yoksa 8000 kullan
 PORT = int(os.environ.get("PORT", 8000))
 
-# 2. Tarayıcı açma hatasını engelle (Sunucuda ekran yoktur)
-import webbrowser
+# 2. Sunucuda tarayıcı açmaya çalışıp hata vermesini engelle
 webbrowser.open = lambda x: None 
 
-# 3. HTTPServer'ı Railway'e göre yamala
-# Bu kısım senin trading_bot içindeki 'localhost'u geçersiz kılar
+# 3. Orijinal koddaki (localhost, 8000) kısmını ezecek yama
 class RailwayServer(http.server.HTTPServer):
     def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
-        # Orijinal kod ne isterse istesin, biz 0.0.0.0:PORT veriyoruz
+        # Orijinal kod ne gönderirse göndersin, biz 0.0.0.0 ve Railway portuna zorluyoruz
         super().__init__(('0.0.0.0', PORT), RequestHandlerClass, bind_and_activate)
 
+# Python'ın standart kütüphanesindeki sınıfı bizim yamalı versiyonumuzla değiştiriyoruz
 http.server.HTTPServer = RailwayServer
 
-# 4. Orijinal botu içe aktar
+# 4. Orijinal dosyanı içe aktar
 try:
     import trading_bot
 except Exception as e:
-    print(f"Bot yüklenirken hata oluştu: {e}")
+    print(f"Hata: trading_bot.py yuklenemedi: {e}")
     sys.exit(1)
 
 if __name__ == '__main__':
-    print(f"--- Railway Başlatılıyor ---")
-    print(f"Port: {PORT}")
-    # Orijinal main() fonksiyonunu çalıştır
+    print(f"--- BOT AKTIF EDILIYOR ---")
+    print(f"Railway Portu: {PORT} dinleniyor...")
+    # Senin orijinal dosmandaki main() fonksiyonunu çağırır
     trading_bot.main()
