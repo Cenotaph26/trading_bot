@@ -7,7 +7,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ── BINANCE CLIENT ────────────────────────────────────────────
 class BinanceClient:
-    BASE = "https://fapi.binance.com"
+    BASE = "https://testnet.binancefuture.com"
     def __init__(self):
         self.symbols=[]
         self.ticker={}
@@ -1073,6 +1073,8 @@ function buildPositions(){
         <span>Anlik <b>$${f(p.cur)}</b></span>
         <span>Take Profit <b style="color:var(--green)">$${f(p.tp)}</b></span>
         <span>Stop Loss <b style="color:var(--red)">$${f(p.sl)}</b></span>
+        <span>Poz. Buyuklugu <b style="color:var(--cyan)">$${(p.sz||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</b></span>
+        <span>Marjin <b style="color:var(--yellow)">$${((p.sz||0)/p.lev).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</b></span>
       </div>
       <div class="prog-wrap">
         <div class="prog-labels">
