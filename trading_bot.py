@@ -19,6 +19,9 @@ class BinanceClient:
         self.ping_ms=None
         self.server_time=None
         self.account_balance=None
+        self.account_available=None
+        self.account_unrealized=None
+        self.account_equity=None
         self.balance_asset="USDT"
         self.api_error=None
         self._fetch_symbols()
@@ -45,9 +48,16 @@ class BinanceClient:
             if isinstance(data,list):
                 for asset in data:
                     if asset.get('asset')=='USDT':
-                        self.account_balance=float(asset.get('availableBalance',0))
+                        # walletBalance = realize edilmiş bakiye (pozisyon açık/kapalı fark etmez gerçek cüzdan)
+                        wallet = float(asset.get('walletBalance', 0))
+                        available = float(asset.get('availableBalance', 0))
+                        unrealized = float(asset.get('unrealizedProfit', 0))
+                        self.account_balance = wallet          # göstermek için
+                        self.account_available = available     # serbest marjin
+                        self.account_unrealized = unrealized   # açık poz. PNL
+                        self.account_equity = wallet + unrealized  # gerçek toplam değer
                         self.api_error=None
-                        return self.account_balance
+                        return wallet
                 self.api_error="USDT bakiyesi bulunamadi"
             else:
                 self.api_error=data.get('msg','Bilinmeyen hata')
@@ -55,6 +65,32 @@ class BinanceClient:
         except Exception as e:
             self.api_error=f"Baglanti hatasi: {e}"
             return None
+
+    def fetch_position_pnl(self):
+        """Açık pozisyonların gerçek unrealized PNL'ini çek"""
+        if not self.api_key or not self.api_secret: return {}
+        try:
+            ts=int(time.time()*1000)
+            params=self._sign({'timestamp':ts,'recvWindow':5000})
+            headers={'X-MBX-APIKEY':self.api_key}
+            r=requests.get(f"{self.BASE}/fapi/v2/positionRisk",params=params,headers=headers,timeout=10)
+            data=r.json()
+            result={}
+            if isinstance(data,list):
+                for p in data:
+                    amt=float(p.get('positionAmt',0))
+                    if amt!=0:
+                        sym=p['symbol']
+                        result[sym]={
+                            'unrealizedProfit': float(p.get('unrealizedProfit',0)),
+                            'entryPrice': float(p.get('entryPrice',0)),
+                            'markPrice': float(p.get('markPrice',0)),
+                            'positionAmt': amt,
+                            'leverage': int(p.get('leverage',1)),
+                            'percentage': float(p.get('percentage',0)),
+                        }
+            return result
+        except: return {}
 
     def ping(self):
         try:
@@ -415,20 +451,53 @@ class Agent:
 
     def update(self):
         close=[]
+        # Canlı pozisyonlar varsa testnet'ten gerçek PNL çek
+        live_pnls={}
+        has_live=any(p.get('live') for p in self.positions.values())
+        if has_live and self.bc.api_key and self.bc.api_secret:
+            live_pnls=self.bc.fetch_position_pnl()
+            # Bakiyeyi de güncelle
+            bal=self.bc.fetch_balance()
+            if bal is not None and bal>0:
+                self.balance=bal
+
         for sym,pos in self.positions.items():
             try:
                 p=self.bc.price(sym)
                 if p==0: continue
                 pos['cur']=p
                 m=pos['lev']
-                if pos['type']=='LONG':
-                    pct=(p-pos['entry'])/pos['entry']*100*m
+
+                if pos.get('live') and sym in live_pnls:
+                    # Testnet'ten gelen gerçek değerler
+                    lp=live_pnls[sym]
+                    pnl=lp['unrealizedProfit']
+                    # entry'yi de güncelle
+                    if lp['entryPrice']>0:
+                        pos['entry']=lp['entryPrice']
+                    if lp['markPrice']>0:
+                        pos['cur']=lp['markPrice']
+                    # pct hesapla
+                    if pos['entry']>0:
+                        if pos['type']=='LONG':
+                            pct=(pos['cur']-pos['entry'])/pos['entry']*100*m
+                        else:
+                            pct=(pos['entry']-pos['cur'])/pos['entry']*100*m
+                    else:
+                        pct=lp['percentage']
                 else:
-                    pct=(pos['entry']-p)/pos['entry']*100*m
-                pnl=pos['sz']*pct/100
-                pos['pnl']=pnl; pos['pnl_pct']=pct
+                    # Simüle mod
+                    if pos['type']=='LONG':
+                        pct=(p-pos['entry'])/pos['entry']*100*m
+                    else:
+                        pct=(pos['entry']-p)/pos['entry']*100*m
+                    pnl=pos['sz']*pct/100
+
+                pos['pnl']=round(pnl,4)
+                pos['pnl_pct']=round(pct,4)
                 pos['max_pnl']=max(pos['max_pnl'],pnl)
                 pos['min_pnl']=min(pos['min_pnl'],pnl)
+
                 if pos['type']=='LONG':
                     if p>=pos['tp']: close.append((sym,'TP'))
                     elif p<=pos['sl']: close.append((sym,'SL'))
@@ -569,14 +638,20 @@ class Engine:
                             tp=p['tp'],sl=p['sl'],sz=p['sz'],lev=p['lev'],
                             pnl=round(p['pnl'],2),pnl_pct=round(p['pnl_pct'],2),
                             strat=p['strat'],reasons=p['reasons'],ind=p['ind'],
-                            t0=p['t0'],conf=p['conf'],
+                            t0=p['t0'],conf=p['conf'],live=p.get('live',False),
+                            margin=round(p.get('margin',p['sz']/p['lev']),2),
                             klines=p['klines'][-30:])
         pct=0
         if self.agent.start_balance>0:
             pct=round(self.agent.total_pnl()/self.agent.start_balance*100,2)
+        # Toplam unrealized PNL (tüm açık pozisyonlar)
+        unrealized_total=round(sum(p['pnl'] for p in self.agent.positions.values()),2)
+        equity=round(self.agent.balance+unrealized_total,2)
         return dict(
             balance=round(self.agent.balance,2),
             start_balance=round(self.agent.start_balance,2),
+            equity=equity,
+            unrealized_pnl=unrealized_total,
             total_pnl=self.agent.total_pnl(),
             total_pnl_pct=pct,
             trades=self.agent.trades,wins=self.agent.wins,
@@ -595,6 +670,9 @@ class Engine:
                 last_ping=self.bc.last_ping,
                 base=self.bc.BASE,
                 account_balance=self.bc.account_balance,
+                account_available=self.bc.account_available,
+                account_unrealized=self.bc.account_unrealized,
+                account_equity=self.bc.account_equity,
                 api_error=self.bc.api_error,
                 has_key=bool(self.bc.api_key),
             ),
@@ -1473,19 +1551,27 @@ function buildStats(){
   const wr=data.wr||50;
   const bal=data.balance||0;
   const startBal=data.start_balance||0;
+  const unrealized=data.unrealized_pnl||0;
+  const equity=data.equity||bal;
 
   const fmtBal=v=>v>0?'$'+v.toLocaleString('en-US',{minimumFractionDigits:2}):'--';
-  document.getElementById('hdr-balance').textContent=fmtBal(bal);
-  document.getElementById('hdr-pnl').textContent=fPnl(pnl);
-  document.getElementById('hdr-pnl').className='stat-mini-v '+cl(pnl);
+
+  // Header: equity (cüzdan + unrealized) göster
+  document.getElementById('hdr-balance').textContent=fmtBal(equity);
+  // PNL header: realized PNL + unrealized birlikte
+  const totalPnl=pnl+unrealized;
+  document.getElementById('hdr-pnl').textContent=fPnl(totalPnl);
+  document.getElementById('hdr-pnl').className='stat-mini-v '+cl(totalPnl);
   document.getElementById('hdr-wr').textContent=(wr).toFixed(1)+'%';
   document.getElementById('hdr-wr').className='stat-mini-v '+cl(wr-50);
 
-  document.getElementById('s-bal').textContent=fmtBal(bal);
-  document.getElementById('s-bal-start').textContent='Baslangic: '+(startBal>0?'$'+startBal.toLocaleString('en-US',{minimumFractionDigits:2}):'API bekleniyor');
+  // Stats kartları
+  document.getElementById('s-bal').textContent=fmtBal(equity);
+  document.getElementById('s-bal-start').textContent='Cüzdan: '+(bal>0?'$'+bal.toLocaleString('en-US',{minimumFractionDigits:2})+' | Başl: $'+startBal.toLocaleString('en-US',{minimumFractionDigits:2}):'API bekleniyor');
+  // PNL kartı: realized göster, unrealized altında
   document.getElementById('s-pnl').textContent=fPnl(pnl);
   document.getElementById('s-pnl').className='sc-v '+cl(pnl);
-  document.getElementById('s-pnl-pct').textContent=(pct>=0?'+':'')+pct+'%';
+  document.getElementById('s-pnl-pct').textContent=(pct>=0?'+':'')+pct+'% | Unreal: '+fPnl(unrealized);
   document.getElementById('s-tr').textContent=data.trades||0;
   document.getElementById('s-wl').textContent=`W:${data.wins||0} / L:${(data.trades||0)-(data.wins||0)}`;
   document.getElementById('s-wr').textContent=wr.toFixed(1)+'%';
@@ -1508,7 +1594,10 @@ function buildStats(){
   document.getElementById('conn-last').textContent=conn.last_ping||'--';
   const apiStat=document.getElementById('conn-api-status');
   if(conn.has_key && conn.account_balance!=null){
-    document.getElementById('conn-balance').textContent='$'+conn.account_balance.toLocaleString('en-US',{minimumFractionDigits:2});
+    const eq=conn.account_equity!=null?conn.account_equity:conn.account_balance;
+    const unr=conn.account_unrealized!=null?conn.account_unrealized:0;
+    const unrStr=unr!==0?' <span style="color:'+(unr>=0?'var(--green)":'var(--red)')+'">('+(unr>=0?'+':'')+unr.toFixed(2)+')</span>':''
+    document.getElementById('conn-balance').innerHTML='$'+eq.toLocaleString('en-US',{minimumFractionDigits:2})+unrStr;
     apiStat.innerHTML='<span style="color:var(--green)">● API AKTIF</span>';
   } else if(conn.has_key && conn.api_error){
     document.getElementById('conn-balance').textContent='HATA';
