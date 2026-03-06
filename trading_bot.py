@@ -41,29 +41,49 @@ class BinanceClient:
             return None
         try:
             ts=int(time.time()*1000)
-            params=self._sign({'timestamp':ts,'recvWindow':5000})
             headers={'X-MBX-APIKEY':self.api_key}
-            r=requests.get(f"{self.BASE}/fapi/v2/balance",params=params,headers=headers,timeout=10)
+
+            # Önce /fapi/v2/account dene — testnet için en güvenilir
+            params=self._sign({'timestamp':ts,'recvWindow':5000})
+            r=requests.get(f"{self.BASE}/fapi/v2/account",params=params,headers=headers,timeout=10)
             data=r.json()
-            if isinstance(data,list):
-                for asset in data:
-                    if asset.get('asset')=='USDT':
-                        # walletBalance = realize edilmiş bakiye (pozisyon açık/kapalı fark etmez gerçek cüzdan)
-                        wallet = float(asset.get('walletBalance', 0))
-                        available = float(asset.get('availableBalance', 0))
-                        unrealized = float(asset.get('unrealizedProfit', 0))
-                        self.account_balance = wallet          # göstermek için
-                        self.account_available = available     # serbest marjin
-                        self.account_unrealized = unrealized   # açık poz. PNL
-                        self.account_equity = wallet + unrealized  # gerçek toplam değer
-                        self.api_error=None
-                        return wallet
-                self.api_error="USDT bakiyesi bulunamadi"
+
+            wallet=None
+            available=None
+            unrealized=None
+
+            if 'totalWalletBalance' in data:
+                wallet    = float(data['totalWalletBalance'])
+                available = float(data.get('availableBalance', wallet))
+                unrealized= float(data.get('totalUnrealizedProfit', 0))
             else:
-                self.api_error=data.get('msg','Bilinmeyen hata')
+                # Fallback: /fapi/v2/balance
+                ts2=int(time.time()*1000)
+                params2=self._sign({'timestamp':ts2,'recvWindow':5000})
+                r2=requests.get(f"{self.BASE}/fapi/v2/balance",params=params2,headers=headers,timeout=10)
+                data2=r2.json()
+                if isinstance(data2,list):
+                    for asset in data2:
+                        if asset.get('asset')=='USDT':
+                            wallet    = float(asset.get('walletBalance',0))
+                            available = float(asset.get('availableBalance', wallet))
+                            unrealized= float(asset.get('crossUnPnl',0))
+                            break
+
+            if wallet is not None:
+                self.account_balance   = wallet
+                self.account_available = available
+                self.account_unrealized= unrealized if unrealized else 0.0
+                self.account_equity    = wallet + (unrealized or 0.0)
+                self.api_error=None
+                print(f"[BAL] wallet={wallet:.2f} avail={available:.2f} unreal={unrealized:.2f}")
+                return wallet
+
+            self.api_error="USDT bakiyesi bulunamadi"
             return None
         except Exception as e:
             self.api_error=f"Baglanti hatasi: {e}"
+            print(f"[BAL ERR] {e}")
             return None
 
     def fetch_position_pnl(self):
