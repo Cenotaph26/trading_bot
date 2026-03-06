@@ -653,19 +653,23 @@ class Engine:
 
     def state(self):
         coins={}
-        for s in self.bc.symbols:
+        for s in self.bc.symbols[:200]:   # max 200 coin JSON boyutunu sınırla
             t=self.bc.info(s)
-            coins[s]=dict(price=t.get('price',0),change=round(t.get('change',0),2),
-                          volume=t.get('volume',0),high=t.get('high',0),low=t.get('low',0))
+            if t.get('price',0)>0:        # fiyatı olan coinleri göster
+                coins[s]=dict(price=t.get('price',0),change=round(t.get('change',0),2),
+                              volume=t.get('volume',0),high=t.get('high',0),low=t.get('low',0))
         pos_out={}
         for s,p in self.agent.positions.items():
-            pos_out[s]=dict(type=p['type'],entry=p['entry'],cur=p['cur'],
-                            tp=p['tp'],sl=p['sl'],sz=p['sz'],lev=p['lev'],
-                            pnl=round(p['pnl'],2),pnl_pct=round(p['pnl_pct'],2),
-                            strat=p['strat'],reasons=p['reasons'],ind=p['ind'],
-                            t0=p['t0'],conf=p['conf'],live=p.get('live',False),
-                            margin=round(p.get('margin',p['sz']/p['lev']),2),
-                            klines=p['klines'][-30:])
+            try:
+                pos_out[s]=dict(type=p['type'],entry=p['entry'],cur=p['cur'],
+                                tp=p['tp'],sl=p['sl'],sz=p['sz'],lev=p['lev'],
+                                pnl=round(p['pnl'],2),pnl_pct=round(p['pnl_pct'],2),
+                                strat=p['strat'],reasons=p['reasons'],ind=p['ind'],
+                                t0=p['t0'],conf=p['conf'],live=p.get('live',False),
+                                margin=round(p.get('margin',p['sz']/max(p['lev'],1)),2),
+                                klines=p['klines'][-20:])
+            except Exception as pe:
+                print(f"pos_out err {s}: {pe}")
         pct=0
         if self.agent.start_balance>0:
             pct=round(self.agent.total_pnl()/self.agent.start_balance*100,2)
@@ -1820,10 +1824,21 @@ window.addEventListener('resize',()=>{
 engine_g = None
 
 class H(BaseHTTPRequestHandler):
+    def _cors(self):
+        self.send_header('Access-Control-Allow-Origin','*')
+        self.send_header('Access-Control-Allow-Methods','GET,POST,OPTIONS')
+        self.send_header('Access-Control-Allow-Headers','Content-Type')
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
     def do_POST(self):
         try:
             length=int(self.headers.get('Content-Length',0))
-            body=json.loads(self.rfile.read(length))
+            raw=self.rfile.read(length)
+            body=json.loads(raw) if raw else {}
             if self.path=='/api/setkeys':
                 ak=body.get('api_key','').strip()
                 sk=body.get('api_secret','').strip()
@@ -1834,51 +1849,86 @@ class H(BaseHTTPRequestHandler):
                 bal=engine_g.bc.fetch_balance()
                 if bal is not None and bal>0:
                     engine_g.agent.balance=bal
-                    # start_balance'ı sadece sıfırsa güncelle (ilk bağlantı)
                     if engine_g.agent.start_balance<=0:
                         engine_g.agent.start_balance=bal
                         engine_g.agent.pnl_curve=[bal]
                     engine_g.log(f"API baglandi | Bakiye: ${bal:,.2f}","success")
-                    msg="ok"
+                    resp={'status':'ok','balance':bal}
                 else:
-                    engine_g.log(f"API hatasi: {engine_g.bc.api_error}","error")
-                    msg=engine_g.bc.api_error or "error"
+                    err=engine_g.bc.api_error or "Bilinmeyen hata"
+                    engine_g.log(f"API hatasi: {err}","error")
+                    resp={'status':err,'balance':0}
+                payload=json.dumps(resp).encode()
                 self.send_response(200)
+                self._cors()
                 self.send_header('Content-type','application/json')
-                self.send_header('Access-Control-Allow-Origin','*')
+                self.send_header('Content-Length',str(len(payload)))
                 self.end_headers()
-                self.wfile.write(json.dumps({'status':msg,'balance':bal}).encode())
+                self.wfile.write(payload)
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except BrokenPipeError: pass
         except Exception as e:
             print(f"POST err: {e}")
+            try:
+                payload=json.dumps({'status':str(e),'balance':0}).encode()
+                self.send_response(500)
+                self._cors()
+                self.send_header('Content-type','application/json')
+                self.send_header('Content-Length',str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except: pass
 
     def do_GET(self):
         try:
-            if self.path=='/':
+            path=self.path.split('?')[0]
+            if path=='/':
+                payload=HTML.encode('utf-8')
                 self.send_response(200)
                 self.send_header('Content-type','text/html;charset=utf-8')
+                self.send_header('Content-Length',str(len(payload)))
                 self.end_headers()
-                self.wfile.write(HTML.encode('utf-8'))
-            elif self.path=='/api/status':
+                self.wfile.write(payload)
+            elif path=='/api/status':
+                try:
+                    state=engine_g.state() if engine_g else {}
+                    payload=json.dumps(state).encode()
+                except Exception as se:
+                    print(f"state() err: {se}")
+                    payload=json.dumps({'error':str(se),'running':False}).encode()
                 self.send_response(200)
+                self._cors()
                 self.send_header('Content-type','application/json')
-                self.send_header('Access-Control-Allow-Origin','*')
+                self.send_header('Content-Length',str(len(payload)))
                 self.end_headers()
-                self.wfile.write(json.dumps(engine_g.state() if engine_g else {}).encode())
-            elif self.path=='/api/start':
-                self.send_response(200)
-                self.send_header('Content-type','text/plain')
-                self.end_headers()
+                self.wfile.write(payload)
+            elif path=='/api/start':
                 if engine_g and not engine_g.running:
                     threading.Thread(target=engine_g.start,daemon=True).start()
-                self.wfile.write(b'ok')
-            elif self.path=='/api/stop':
                 self.send_response(200)
+                self._cors()
                 self.send_header('Content-type','text/plain')
                 self.end_headers()
-                if engine_g: engine_g.stop()
                 self.wfile.write(b'ok')
+            elif path=='/api/stop':
+                if engine_g: engine_g.stop()
+                self.send_response(200)
+                self._cors()
+                self.send_header('Content-type','text/plain')
+                self.end_headers()
+                self.wfile.write(b'ok')
+            else:
+                self.send_response(404)
+                self.end_headers()
         except BrokenPipeError: pass
-        except Exception as e: print(f"req err: {e}")
+        except Exception as e:
+            print(f"GET err {self.path}: {e}")
+            try:
+                self.send_response(500)
+                self.end_headers()
+            except: pass
     def log_message(self,*a): pass
 
 def main():
