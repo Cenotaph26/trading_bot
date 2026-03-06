@@ -335,7 +335,7 @@ class Agent:
         self.history=[]
         self.trades=0
         self.wins=0
-        self.pnl_curve=[start]
+        self.pnl_curve=[start] if start>0 else []
         self.strategies={'Trend Following':1.0,'Mean Reversion':1.0,'Breakout':1.0,'Scalping':1.0}
         self._klines_cache={}
         self._order_ids={}  # sym -> binance orderId
@@ -443,6 +443,11 @@ class Agent:
                 # Miktar = pozisyon boyutu / fiyat
                 raw_qty=sz/p
                 qty=round(max(raw_qty, min_qty*2), qty_prec)
+                # Binance minimum notional = $5 kontrolü
+                notional=qty*p
+                if notional<6:
+                    min_notional_qty=round(6.0/p*1.05, qty_prec)
+                    qty=max(qty, min_notional_qty)
                 side='BUY' if d['action']=='LONG' else 'SELL'
                 result, err=self.bc.place_order(sym, side, qty)
                 if result:
@@ -1223,6 +1228,12 @@ function buildTicker(){
 // ── COIN GRID ─────────────────────────────────────────────
 function buildCoins(){
   const coins=data.coins||{};
+  if(Object.keys(coins).length===0){
+    document.getElementById('cg').innerHTML='<div class="empty">Veriler yukleniyor...</div>';
+    document.getElementById('coin-count-lbl').textContent='yükleniyor...';
+    document.getElementById('s-coins').textContent='--';
+    return;
+  }
   const pos=new Set(Object.keys(data.positions||{}));
   let h='', count=0;
   for(const[s,c]of Object.entries(coins)){
@@ -1770,8 +1781,10 @@ function closeModal(){document.getElementById('modal').classList.remove('show')}
 async function tick(){
   try{
     const r=await fetch('/api/status');
-    data=await r.json();
-    if(data.error)return;
+    const fresh=await r.json();
+    if(fresh&&!fresh.error){
+      data=fresh;
+    }
 
     running=data.running||false;
     syncUI();
@@ -1785,11 +1798,14 @@ async function tick(){
 
     if(chartMode==='pnl') drawPnlChart(data.curve||[]);
     else if(chartMode==='candle'&&curSym) showCandles(curSym);
-  }catch(e){console.error(e)}
+  }catch(e){
+    console.error('tick error:',e);
+  }
 }
 
-// Init
+// Init — hemen çalıştır, 2sn sonra tekrar, sonra 3sn'de bir
 tick();
+setTimeout(tick,2000);
 setInterval(tick,3000);
 window.addEventListener('resize',()=>{
   if(chartMode==='pnl') drawPnlChart(data.curve||[]);
@@ -1818,8 +1834,10 @@ class H(BaseHTTPRequestHandler):
                 bal=engine_g.bc.fetch_balance()
                 if bal is not None and bal>0:
                     engine_g.agent.balance=bal
-                    engine_g.agent.start_balance=bal
-                    engine_g.agent.pnl_curve=[bal]
+                    # start_balance'ı sadece sıfırsa güncelle (ilk bağlantı)
+                    if engine_g.agent.start_balance<=0:
+                        engine_g.agent.start_balance=bal
+                        engine_g.agent.pnl_curve=[bal]
                     engine_g.log(f"API baglandi | Bakiye: ${bal:,.2f}","success")
                     msg="ok"
                 else:
