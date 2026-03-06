@@ -159,6 +159,72 @@ class BinanceClient:
     def price(self,s): return self.prices.get(s,0)
     def info(self,s): return self.ticker.get(s,{})
 
+    def get_precision(self, symbol):
+        """Sembol için lot ve fiyat hassasiyetini döndür"""
+        try:
+            r=requests.get(f"{self.BASE}/fapi/v1/exchangeInfo",timeout=10)
+            for s in r.json()['symbols']:
+                if s['symbol']==symbol:
+                    qty_prec=s.get('quantityPrecision',3)
+                    price_prec=s.get('pricePrecision',2)
+                    # minQty bul
+                    min_qty=0.001
+                    for f in s.get('filters',[]):
+                        if f['filterType']=='LOT_SIZE':
+                            min_qty=float(f['minQty'])
+                    return qty_prec, price_prec, min_qty
+        except: pass
+        return 3, 2, 0.001
+
+    def set_leverage(self, symbol, leverage):
+        """Kaldıraç ayarla"""
+        if not self.api_key or not self.api_secret: return False
+        try:
+            ts=int(time.time()*1000)
+            params=self._sign({'symbol':symbol,'leverage':leverage,'timestamp':ts,'recvWindow':5000})
+            headers={'X-MBX-APIKEY':self.api_key}
+            r=requests.post(f"{self.BASE}/fapi/v1/leverage",params=params,headers=headers,timeout=10)
+            return r.status_code==200
+        except: return False
+
+    def place_order(self, symbol, side, quantity, order_type='MARKET'):
+        """Market emri aç. side: BUY veya SELL"""
+        if not self.api_key or not self.api_secret:
+            return None, "API Key girilmedi"
+        try:
+            ts=int(time.time()*1000)
+            params={'symbol':symbol,'side':side,'type':order_type,
+                    'quantity':quantity,'timestamp':ts,'recvWindow':5000}
+            signed=self._sign(params)
+            headers={'X-MBX-APIKEY':self.api_key}
+            r=requests.post(f"{self.BASE}/fapi/v1/order",params=signed,headers=headers,timeout=10)
+            data=r.json()
+            if 'orderId' in data:
+                return data, None
+            else:
+                return None, data.get('msg','Bilinmeyen hata')
+        except Exception as e:
+            return None, str(e)
+
+    def close_position(self, symbol, side, quantity):
+        """Pozisyonu kapat (ters taraf emir)"""
+        close_side='SELL' if side=='LONG' else 'BUY'
+        return self.place_order(symbol, close_side, quantity)
+
+    def get_open_positions(self):
+        """Açık pozisyonları çek"""
+        if not self.api_key or not self.api_secret: return []
+        try:
+            ts=int(time.time()*1000)
+            params=self._sign({'timestamp':ts,'recvWindow':5000})
+            headers={'X-MBX-APIKEY':self.api_key}
+            r=requests.get(f"{self.BASE}/fapi/v2/positionRisk",params=params,headers=headers,timeout=10)
+            data=r.json()
+            if isinstance(data,list):
+                return [p for p in data if float(p.get('positionAmt',0))!=0]
+            return []
+        except: return []
+
 # ── TECHNICAL ANALYSIS ───────────────────────────────────────
 class TA:
     @staticmethod
@@ -216,6 +282,7 @@ class Agent:
         self.pnl_curve=[start]
         self.strategies={'Trend Following':1.0,'Mean Reversion':1.0,'Breakout':1.0,'Scalping':1.0}
         self._klines_cache={}
+        self._order_ids={}  # sym -> binance orderId
 
     def _get_klines(self,sym):
         k=self.bc.klines(sym,'5m',60)
@@ -302,18 +369,49 @@ class Agent:
 
     def open(self,d):
         p,lev=d['price'],d['lev']
-        sz=self.balance*0.08
+        sym=d['sym']
+        # Marjin: bakiyenin %8'i, pozisyon boyutu = marjin * kaldıraç
+        margin=self.balance*0.08
+        sz=margin*lev
         if d['action']=='LONG':
             tp=p*(1+0.018*lev/3); sl=p*(1-0.007*lev/3)
         else:
             tp=p*(1-0.018*lev/3); sl=p*(1+0.007*lev/3)
-        self.positions[d['sym']]=dict(
+
+        order_id=None
+        live=bool(self.bc.api_key and self.bc.api_secret)
+        if live:
+            try:
+                qty_prec, price_prec, min_qty=self.bc.get_precision(sym)
+                self.bc.set_leverage(sym, lev)
+                # Miktar = pozisyon boyutu / fiyat
+                raw_qty=sz/p
+                qty=round(max(raw_qty, min_qty*2), qty_prec)
+                side='BUY' if d['action']=='LONG' else 'SELL'
+                result, err=self.bc.place_order(sym, side, qty)
+                if result:
+                    order_id=result.get('orderId')
+                    # Gerçek fiyatı kullan
+                    if result.get('avgPrice') and float(result['avgPrice'])>0:
+                        p=float(result['avgPrice'])
+                    elif result.get('price') and float(result['price'])>0:
+                        p=float(result['price'])
+                    print(f"[ORDER] {sym} {side} qty={qty} orderId={order_id}")
+                else:
+                    print(f"[ORDER ERR] {sym}: {err}")
+                    live=False
+            except Exception as e:
+                print(f"[ORDER EX] {sym}: {e}")
+                live=False
+
+        self.positions[sym]=dict(
             type=d['action'],entry=p,cur=p,tp=tp,sl=sl,sz=sz,
             lev=lev,pnl=0,pnl_pct=0,strat=d['strat'],
             reasons=d['reasons'],ind=d['ind'],
             klines=d.get('klines',[]),
             t0=datetime.now().isoformat(),
-            conf=d['conf'],max_pnl=0,min_pnl=0)
+            conf=d['conf'],max_pnl=0,min_pnl=0,
+            live=live,order_id=order_id,margin=margin)
 
     def update(self):
         close=[]
@@ -343,7 +441,38 @@ class Agent:
     def close(self,sym,why='Manual'):
         if sym not in self.positions: return
         pos=self.positions[sym]
-        self.balance+=pos['pnl']
+
+        # Gerçek emir kapat
+        if pos.get('live') and self.bc.api_key and self.bc.api_secret:
+            try:
+                qty_prec, _, min_qty=self.bc.get_precision(sym)
+                # Açık pozisyon miktarını testnet'ten çek
+                open_pos=self.bc.get_open_positions()
+                qty=None
+                for op in open_pos:
+                    if op['symbol']==sym:
+                        qty=abs(float(op['positionAmt']))
+                        break
+                if qty and qty>=min_qty:
+                    qty=round(qty, qty_prec)
+                    result, err=self.bc.close_position(sym, pos['type'], qty)
+                    if result:
+                        print(f"[CLOSE] {sym} closed orderId={result.get('orderId')}")
+                        # Gerçek çıkış fiyatını güncelle
+                        if result.get('avgPrice') and float(result['avgPrice'])>0:
+                            pos['cur']=float(result['avgPrice'])
+                    else:
+                        print(f"[CLOSE ERR] {sym}: {err}")
+                # Bakiyeyi testnet'ten güncelle
+                bal=self.bc.fetch_balance()
+                if bal is not None and bal>0:
+                    real_pnl=bal-self.start_balance
+                    self.balance=bal
+            except Exception as e:
+                print(f"[CLOSE EX] {sym}: {e}")
+                self.balance+=pos['pnl']
+        else:
+            self.balance+=pos['pnl']
         self.trades+=1
         won=pos['pnl']>0
         if won: self.wins+=1
@@ -403,7 +532,9 @@ class Engine:
                         d=self.agent.decide(s)
                         if d and len(self.agent.positions)<6:
                             self.agent.open(d)
-                            self.log(f"{s} {d['action']} @ ${d['price']:.4f} | Guven {d['conf']:.0f}% | {', '.join(d['reasons'][:2])}","trade")
+                            pos=self.agent.positions.get(s,{})
+                            live_tag="[CANLI]" if pos.get('live') else "[SIM]"
+                            self.log(f"{live_tag} {s} {d['action']} @ ${d['price']:.4f} | Guven {d['conf']:.0f}% | {', '.join(d['reasons'][:2])}","trade")
                 self.tick+=1
                 time.sleep(3)
             except Exception as e:
@@ -1263,6 +1394,9 @@ function buildPositions(){
         <span class="chip${ind.rsi&&(ind.rsi<32||ind.rsi>68)?' warn':''}">RSI ${ind.rsi||'--'}</span>
         <span class="chip lit">Guven ${(p.conf||0).toFixed(0)}%</span>
         <span class="chip">${p.strat}</span>
+        <span class="chip" style="${p.live?'border-color:var(--green);color:var(--green)':''}">
+          ${p.live?'● CANLI':'○ SIM'}
+        </span>
         <span class="chip lit" onclick="showCandles('${sym}')" style="cursor:pointer">GRAFIK ▸</span>
       </div>
       <div class="pc-ai">
