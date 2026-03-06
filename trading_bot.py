@@ -38,7 +38,7 @@ class BinanceClient:
                    and s['status']=='TRADING'}
             self.symbols=[s for s in PRIORITY if s in valid]
             rest=[s for s in valid if s not in self.symbols]
-            self.symbols+=rest  # tüm coinler
+            self.symbols+=rest
             print(f"✓ {len(self.symbols)} pairs loaded")
         except Exception as e:
             print(f"symbols error: {e}")
@@ -47,10 +47,9 @@ class BinanceClient:
     def _fetch_tickers(self):
         try:
             r=requests.get(f"{self.BASE}/fapi/v1/ticker/24hr",timeout=10)
-            sym_set=set(self.symbols)
             for t in r.json():
                 s=t['symbol']
-                if s in sym_set:
+                if s in self.symbols:
                     self.ticker[s]={
                         'price':float(t['lastPrice']),
                         'change':float(t['priceChangePercent']),
@@ -78,29 +77,17 @@ class BinanceClient:
     def refresh_tickers(self):
         try:
             r=requests.get(f"{self.BASE}/fapi/v1/ticker/24hr",timeout=10)
-            sym_set=set(self.symbols)
             for t in r.json():
                 s=t['symbol']
-                if s in sym_set:
-                    price=float(t['lastPrice'])
-                    self.prices[s]=price
-                    if s in self.ticker:
-                        self.ticker[s].update({
-                            'price':price,
-                            'change':float(t['priceChangePercent']),
-                            'volume':float(t['volume']),
-                            'high':float(t['highPrice']),
-                            'low':float(t['lowPrice']),
-                        })
-                    else:
-                        self.ticker[s]={
-                            'price':price,
-                            'change':float(t['priceChangePercent']),
-                            'volume':float(t['volume']),
-                            'high':float(t['highPrice']),
-                            'low':float(t['lowPrice']),
-                            'quoteVolume':float(t.get('quoteVolume',0)),
-                        }
+                if s in self.symbols:
+                    self.ticker[s].update({
+                        'price':float(t['lastPrice']),
+                        'change':float(t['priceChangePercent']),
+                        'volume':float(t['volume']),
+                        'high':float(t['highPrice']),
+                        'low':float(t['lowPrice']),
+                    })
+                    self.prices[s]=float(t['lastPrice'])
         except: pass
 
     def klines(self, symbol, interval='5m', limit=60):
@@ -115,157 +102,125 @@ class BinanceClient:
     def price(self,s): return self.prices.get(s,0)
     def info(self,s): return self.ticker.get(s,{})
 
-    # ── API KEY DESTEĞI ──────────────────────────────────────
-    def set_keys(self, api_key, api_secret):
-        self.api_key = api_key
-        self.api_secret = api_secret
+    def set_keys(self,ak,sk):
+        self.api_key=ak; self.api_secret=sk
 
-    def _sign(self, params):
-        import hmac, hashlib, urllib.parse
-        qs = urllib.parse.urlencode(params)
-        sig = hmac.new(self.api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
-        params['signature'] = sig
+    def _sign(self,params):
+        import hmac,hashlib,urllib.parse
+        qs=urllib.parse.urlencode(params)
+        params['signature']=hmac.new(sk.encode() if False else self.api_secret.encode(),qs.encode(),hashlib.sha256).hexdigest()
         return params
 
-    def fetch_account(self, force=False):
-        """Bakiye ve unrealized PNL çek — 30sn cache"""
-        if not getattr(self,'api_key',None) or not getattr(self,'api_secret',None):
-            return None
-        # Cache: 30 saniyede bir gerçekten çek
-        now = time.time()
-        if not force and getattr(self,'_acc_cache',None) and now - self._acc_cache_ts < 30:
-            return self._acc_cache
+    def fetch_account(self,force=False):
+        if not getattr(self,'api_key',None): return None
+        now=time.time()
+        if not force and getattr(self,'_acc_ts',0) and now-self._acc_ts<30:
+            return self._acc
         try:
-            ts = int(now*1000)
-            params = self._sign({'timestamp':ts,'recvWindow':5000})
-            headers = {'X-MBX-APIKEY': self.api_key}
-            r = requests.get(f"{self.BASE}/fapi/v2/account", params=params, headers=headers, timeout=10)
-            d = r.json()
+            p=self._sign({'timestamp':int(now*1000),'recvWindow':5000})
+            r=requests.get(f"{self.BASE}/fapi/v2/account",params=p,
+                           headers={'X-MBX-APIKEY':self.api_key},timeout=10)
+            d=r.json()
             if 'totalWalletBalance' in d:
-                result = {
-                    'wallet':    float(d['totalWalletBalance']),
-                    'available': float(d.get('availableBalance', d['totalWalletBalance'])),
-                    'unrealized':float(d.get('totalUnrealizedProfit', 0)),
-                }
-                self._acc_cache = result
-                self._acc_cache_ts = now
-                print(f"[BAL] wallet={result['wallet']:.2f} avail={result['available']:.2f} unreal={result['unrealized']:.2f}")
-                return result
+                self._acc={'wallet':float(d['totalWalletBalance']),
+                           'available':float(d.get('availableBalance',d['totalWalletBalance'])),
+                           'unrealized':float(d.get('totalUnrealizedProfit',0))}
+                self._acc_ts=now
+                print(f"[BAL] wallet={self._acc['wallet']:.2f} unreal={self._acc['unrealized']:.2f}")
+                return self._acc
             else:
-                self._last_err = d.get('msg','?')
-                print(f"[ACCOUNT ERR] {d.get('msg','?')}")
+                self._last_err=d.get('msg','?'); print(f"[BAL ERR] {self._last_err}")
         except Exception as e:
-            self._last_err = str(e)
-            print(f"[ACCOUNT ERR] {e}")
-        return getattr(self,'_acc_cache',None)  # hata varsa eski cache dön
+            self._last_err=str(e); print(f"[BAL EX] {e}")
+        return getattr(self,'_acc',None)
 
-    def place_order(self, symbol, side, usdt_amount, leverage):
-        """Market emri aç. usdt_amount = marjin tutarı (kaldıraçsız)"""
-        if not getattr(self,'api_key',None) or not getattr(self,'api_secret',None):
-            return None
+    def set_leverage(self,symbol,lev):
         try:
-            # Precision bilgisi
-            qty_prec, min_qty = 3, 0.001
-            r0 = requests.get(f"{self.BASE}/fapi/v1/exchangeInfo", timeout=10)
+            p=self._sign({'symbol':symbol,'leverage':lev,'timestamp':int(time.time()*1000),'recvWindow':5000})
+            requests.post(f"{self.BASE}/fapi/v1/leverage",params=p,
+                          headers={'X-MBX-APIKEY':self.api_key},timeout=10)
+        except: pass
+
+    def place_order(self,symbol,side,margin_usdt,leverage):
+        if not getattr(self,'api_key',None): return None
+        try:
+            r0=requests.get(f"{self.BASE}/fapi/v1/exchangeInfo",timeout=10)
+            qty_prec=3; min_qty=0.001
             for s in r0.json().get('symbols',[]):
-                if s['symbol'] == symbol:
-                    qty_prec = s.get('quantityPrecision', 3)
+                if s['symbol']==symbol:
+                    qty_prec=s.get('quantityPrecision',3)
                     for f in s.get('filters',[]):
-                        if f['filterType'] == 'LOT_SIZE':
-                            min_qty = float(f['minQty'])
+                        if f['filterType']=='LOT_SIZE': min_qty=float(f['minQty'])
                     break
-            # Kaldıraç ayarla
-            ts = int(time.time()*1000)
-            lp = self._sign({'symbol':symbol,'leverage':leverage,'timestamp':ts,'recvWindow':5000})
-            requests.post(f"{self.BASE}/fapi/v1/leverage", params=lp,
-                          headers={'X-MBX-APIKEY':self.api_key}, timeout=10)
-            # Miktar hesapla: (marjin * kaldıraç) / fiyat
-            price = self.price(symbol)
-            if price <= 0: return None
-            notional = usdt_amount * leverage
-            qty = round(max(notional / price, min_qty), qty_prec)
-            # Minimum $5 notional
-            if qty * price < 5.5:
-                qty = round(5.5 / price * 1.1, qty_prec)
-            ts2 = int(time.time()*1000)
-            op = self._sign({'symbol':symbol,'side':side,'type':'MARKET',
-                             'quantity':qty,'timestamp':ts2,'recvWindow':5000})
-            r2 = requests.post(f"{self.BASE}/fapi/v1/order", params=op,
-                               headers={'X-MBX-APIKEY':self.api_key}, timeout=10)
-            d = r2.json()
+            self.set_leverage(symbol,leverage)
+            pr=self.price(symbol)
+            if pr<=0: return None
+            qty=round(max(margin_usdt*leverage/pr, min_qty), qty_prec)
+            if qty*pr<5.5: qty=round(5.5/pr*1.1, qty_prec)
+            p=self._sign({'symbol':symbol,'side':side,'type':'MARKET',
+                          'quantity':qty,'timestamp':int(time.time()*1000),'recvWindow':5000})
+            r=requests.post(f"{self.BASE}/fapi/v1/order",params=p,
+                            headers={'X-MBX-APIKEY':self.api_key},timeout=10)
+            d=r.json()
             if 'orderId' in d:
-                print(f"[ORDER OK] {symbol} {side} qty={qty} id={d['orderId']}")
-                return d
+                print(f"[ORDER OK] {symbol} {side} qty={qty} id={d['orderId']}"); return d
             else:
                 print(f"[ORDER ERR] {symbol}: {d.get('msg','?')}")
         except Exception as e:
             print(f"[ORDER EX] {symbol}: {e}")
         return None
 
-    def close_order(self, symbol, side, qty):
-        """Pozisyonu kapat"""
-        if not getattr(self,'api_key',None) or not getattr(self,'api_secret',None):
-            return None
+    def close_position(self,symbol,side,qty):
+        if not getattr(self,'api_key',None): return None
         try:
-            close_side = 'SELL' if side == 'LONG' else 'BUY'
-            ts = int(time.time()*1000)
-            params = self._sign({'symbol':symbol,'side':close_side,'type':'MARKET',
-                                 'quantity':qty,'timestamp':ts,'recvWindow':5000,
-                                 'reduceOnly':'true'})
-            r = requests.post(f"{self.BASE}/fapi/v1/order", params=params,
-                              headers={'X-MBX-APIKEY':self.api_key}, timeout=10)
-            d = r.json()
-            if 'orderId' in d:
-                print(f"[CLOSE OK] {symbol} {close_side} qty={qty}")
-                return d
-            else:
-                print(f"[CLOSE ERR] {symbol}: {d.get('msg','?')}")
+            close_side='SELL' if side=='LONG' else 'BUY'
+            p=self._sign({'symbol':symbol,'side':close_side,'type':'MARKET',
+                          'quantity':qty,'reduceOnly':'true',
+                          'timestamp':int(time.time()*1000),'recvWindow':5000})
+            r=requests.post(f"{self.BASE}/fapi/v1/order",params=p,
+                            headers={'X-MBX-APIKEY':self.api_key},timeout=10)
+            d=r.json()
+            if 'orderId' in d: print(f"[CLOSE OK] {symbol} qty={qty}"); return d
+            else: print(f"[CLOSE ERR] {symbol}: {d.get('msg','?')}")
         except Exception as e:
             print(f"[CLOSE EX] {symbol}: {e}")
         return None
 
-    def get_position_qty(self, symbol):
-        """Açık pozisyonun miktarını çek"""
+    def get_pos_qty(self,symbol):
         if not getattr(self,'api_key',None): return 0
         try:
-            ts = int(time.time()*1000)
-            params = self._sign({'symbol':symbol,'timestamp':ts,'recvWindow':5000})
-            r = requests.get(f"{self.BASE}/fapi/v2/positionRisk", params=params,
-                             headers={'X-MBX-APIKEY':self.api_key}, timeout=10)
-            for p in r.json():
-                if p['symbol'] == symbol:
-                    return abs(float(p.get('positionAmt', 0)))
+            p=self._sign({'symbol':symbol,'timestamp':int(time.time()*1000),'recvWindow':5000})
+            r=requests.get(f"{self.BASE}/fapi/v2/positionRisk",params=p,
+                           headers={'X-MBX-APIKEY':self.api_key},timeout=10)
+            for pos in r.json():
+                if pos['symbol']==symbol: return abs(float(pos.get('positionAmt',0)))
         except: pass
         return 0
 
-    def fetch_live_pnl(self, force=False):
-        """Tüm açık pozisyonların gerçek PNL verisi — 10sn cache"""
+    def fetch_live_pnl(self):
         if not getattr(self,'api_key',None): return {}
-        now = time.time()
-        if not force and getattr(self,'_pnl_cache',None) and now - self._pnl_cache_ts < 10:
-            return self._pnl_cache
+        now=time.time()
+        if getattr(self,'_pnl_ts',0) and now-self._pnl_ts<10:
+            return getattr(self,'_pnl',{})
         try:
-            ts = int(now*1000)
-            params = self._sign({'timestamp':ts,'recvWindow':5000})
-            r = requests.get(f"{self.BASE}/fapi/v2/positionRisk", params=params,
-                             headers={'X-MBX-APIKEY':self.api_key}, timeout=10)
-            result = {}
-            for p in r.json():
-                amt = float(p.get('positionAmt', 0))
-                if abs(amt) > 0:
-                    result[p['symbol']] = {
-                        'qty':        abs(amt),
-                        'entry':      float(p.get('entryPrice', 0)),
-                        'mark':       float(p.get('markPrice', 0)),
-                        'pnl':        float(p.get('unRealizedProfit', 0)),
-                        'leverage':   int(p.get('leverage', 1)),
+            p=self._sign({'timestamp':int(now*1000),'recvWindow':5000})
+            r=requests.get(f"{self.BASE}/fapi/v2/positionRisk",params=p,
+                           headers={'X-MBX-APIKEY':self.api_key},timeout=10)
+            result={}
+            for pos in r.json():
+                amt=float(pos.get('positionAmt',0))
+                if abs(amt)>0:
+                    result[pos['symbol']]={
+                        'qty':abs(amt),
+                        'entry':float(pos.get('entryPrice',0)),
+                        'mark':float(pos.get('markPrice',0)),
+                        'pnl':float(pos.get('unRealizedProfit',0)),
                     }
-            self._pnl_cache = result
-            self._pnl_cache_ts = now
+            self._pnl=result; self._pnl_ts=now
             return result
         except Exception as e:
-            print(f"[PNL FETCH ERR] {e}")
-        return getattr(self,'_pnl_cache',{})
+            print(f"[PNL ERR] {e}")
+        return getattr(self,'_pnl',{})
 
 # ── TECHNICAL ANALYSIS ───────────────────────────────────────
 class TA:
@@ -312,16 +267,13 @@ class TA:
 class Agent:
     def __init__(self,bc):
         self.bc=bc
-        # Başlangıç bakiyesi: API varsa Binance'tan çek, yoksa 0
-        acc = bc.fetch_account()
-        start = acc['wallet'] if acc and acc['wallet'] > 0 else 0.0
-        self.balance=start
-        self.start_balance=start
+        self.balance=0
+        self.start_balance=0
         self.positions={}
         self.history=[]
         self.trades=0
         self.wins=0
-        self.pnl_curve=[start] if start > 0 else [0]
+        self.pnl_curve=[]
         self.strategies={'Trend Following':1.0,'Mean Reversion':1.0,'Breakout':1.0,'Scalping':1.0}
         self._klines_cache={}
 
@@ -409,105 +361,70 @@ class Agent:
         return 'Trend Following'
 
     def open(self,d):
+        if self.balance<=0: return   # bakiye yoksa açma
         p,lev=d['price'],d['lev']
-        margin=self.balance*0.08          # marjin = bakiyenin %8'i
-        sz=margin*lev                      # pozisyon boyutu = marjin × kaldıraç
+        margin=self.balance*0.08
+        sz=margin*lev
         if d['action']=='LONG':
             tp=p*(1+0.018*lev/3); sl=p*(1-0.007*lev/3)
         else:
             tp=p*(1-0.018*lev/3); sl=p*(1+0.007*lev/3)
-
-        # Gerçek emir gönder
-        live = False
-        order_result = None
-        if getattr(self.bc,'api_key',None) and getattr(self.bc,'api_secret',None):
-            side = 'BUY' if d['action']=='LONG' else 'SELL'
-            order_result = self.bc.place_order(d['sym'], side, margin, lev)
-            if order_result:
-                live = True
-                if order_result.get('avgPrice') and float(order_result['avgPrice'])>0:
-                    p = float(order_result['avgPrice'])
-
+        live=False
+        if getattr(self.bc,'api_key',None):
+            side='BUY' if d['action']=='LONG' else 'SELL'
+            res=self.bc.place_order(d['sym'],side,margin,lev)
+            if res:
+                live=True
+                ap=float(res.get('avgPrice',0) or 0)
+                if ap>0: p=ap
         self.positions[d['sym']]=dict(
             type=d['action'],entry=p,cur=p,tp=tp,sl=sl,sz=sz,margin=margin,
             lev=lev,pnl=0,pnl_pct=0,strat=d['strat'],
             reasons=d['reasons'],ind=d['ind'],
             klines=d.get('klines',[]),
             t0=datetime.now().isoformat(),
-            conf=d['conf'],max_pnl=0,min_pnl=0,
-            live=live)
+            conf=d['conf'],max_pnl=0,min_pnl=0,live=live)
 
     def update(self):
         close=[]
-        # Canlı pozisyon varsa Binance'ten gerçek PNL çek
-        has_live = any(p.get('live') for p in self.positions.values())
-        live_data = self.bc.fetch_live_pnl() if has_live else {}
-
+        live_pnl=self.bc.fetch_live_pnl() if any(p.get('live') for p in self.positions.values()) else {}
         for sym,pos in self.positions.items():
             try:
                 p=self.bc.price(sym)
                 if p==0: continue
-                pos['cur']=p
-
-                if pos.get('live') and sym in live_data:
-                    # Gerçek Binance verisi kullan
-                    ld = live_data[sym]
-                    pnl = ld['pnl']
-                    # entry fiyatı Binance'ten güncelle
-                    if ld['entry'] > 0: pos['entry'] = ld['entry']
-                    mark = ld['mark'] if ld['mark'] > 0 else p
-                    pos['cur'] = mark
-                    sz = pos['sz']
-                    pct = (pnl / sz * 100) if sz > 0 else 0
+                if pos.get('live') and sym in live_pnl:
+                    ld=live_pnl[sym]
+                    pnl=ld['pnl']
+                    if ld['entry']>0: pos['entry']=ld['entry']
+                    p=ld['mark'] if ld['mark']>0 else p
+                    pct=(pnl/pos['sz']*100) if pos['sz']>0 else 0
                 else:
-                    # Simülasyon: yerel hesapla
                     m=pos['lev']
-                    if pos['type']=='LONG':
-                        pct=(p-pos['entry'])/pos['entry']*100*m
-                    else:
-                        pct=(pos['entry']-p)/pos['entry']*100*m
+                    pct=((p-pos['entry'])/pos['entry']*100*m) if pos['type']=='LONG' else ((pos['entry']-p)/pos['entry']*100*m)
                     pnl=pos['sz']*pct/100
-
-                pos['pnl']=round(pnl,4)
-                pos['pnl_pct']=round(pct,4)
+                pos['cur']=p; pos['pnl']=pnl; pos['pnl_pct']=pct
                 pos['max_pnl']=max(pos['max_pnl'],pnl)
                 pos['min_pnl']=min(pos['min_pnl'],pnl)
-
-                # TP/SL kontrolü
-                cur = pos['cur']
                 if pos['type']=='LONG':
-                    if cur>=pos['tp']: close.append((sym,'TP'))
-                    elif cur<=pos['sl']: close.append((sym,'SL'))
+                    if p>=pos['tp']: close.append((sym,'TP'))
+                    elif p<=pos['sl']: close.append((sym,'SL'))
                 else:
-                    if cur<=pos['tp']: close.append((sym,'TP'))
-                    elif cur>=pos['sl']: close.append((sym,'SL'))
-            except Exception as e:
-                print(f"[UPDATE ERR] {sym}: {e}")
+                    if p<=pos['tp']: close.append((sym,'TP'))
+                    elif p>=pos['sl']: close.append((sym,'SL'))
+            except: pass
         for sym,why in close: self.close(sym,why)
 
     def close(self,sym,why='Manual'):
         if sym not in self.positions: return
         pos=self.positions[sym]
-
-        # Gerçek pozisyon kapat
         if pos.get('live') and getattr(self.bc,'api_key',None):
-            try:
-                qty = self.bc.get_position_qty(sym)
-                if qty > 0:
-                    self.bc.close_order(sym, pos['type'], qty)
-                # Kapandıktan sonra gerçek bakiyeyi force çek
-                time.sleep(1)  # emrin işlenmesi için bekle
-                acc = self.bc.fetch_account(force=True)
-                if acc and acc['wallet'] > 0:
-                    self.balance = acc['wallet']
-                    self.start_balance = self.start_balance or acc['wallet']
-                else:
-                    self.balance += pos['pnl']
-            except Exception as e:
-                print(f"[CLOSE EX] {sym}: {e}")
-                self.balance += pos['pnl']
+            qty=self.bc.get_pos_qty(sym)
+            if qty>0: self.bc.close_position(sym,pos['type'],qty)
+            time.sleep(1)
+            acc=self.bc.fetch_account(force=True)
+            self.balance=acc['wallet'] if acc and acc['wallet']>0 else self.balance+pos['pnl']
         else:
-            self.balance += pos['pnl']
+            self.balance+=pos['pnl']
         self.trades+=1
         won=pos['pnl']>0
         if won: self.wins+=1
@@ -564,13 +481,6 @@ class Engine:
                         if d and len(self.agent.positions)<6:
                             self.agent.open(d)
                             self.log(f"{s} {d['action']} @ ${d['price']:.4f} | Guven {d['conf']:.0f}% | {', '.join(d['reasons'][:2])}","trade")
-                # Her 60 tickte bir (~3 dakika) bakiyeyi Binance'ten güncelle
-                if self.tick%60==0 and getattr(self.bc,'api_key',None):
-                    acc = self.bc.fetch_account(force=True)
-                    if acc and acc['wallet'] > 0:
-                        live_count = sum(1 for p in self.agent.positions.values() if p.get('live'))
-                        if live_count == 0:
-                            self.agent.balance = acc['wallet']
                 self.tick+=1
                 time.sleep(3)
             except Exception as e:
@@ -593,31 +503,30 @@ class Engine:
         coins={}
         for s in self.bc.symbols:
             t=self.bc.info(s)
-            pr=t.get('price',0)
-            if pr>0:   # fiyatı olan coinleri gönder
-                coins[s]=dict(price=pr,change=round(t.get('change',0),2),
+            if t.get('price',0)>0:
+                coins[s]=dict(price=t.get('price',0),change=round(t.get('change',0),2),
                               volume=t.get('volume',0),high=t.get('high',0),low=t.get('low',0))
         pos_out={}
         for s,p in self.agent.positions.items():
             pos_out[s]=dict(type=p['type'],entry=p['entry'],cur=p['cur'],
                             tp=p['tp'],sl=p['sl'],sz=p['sz'],lev=p['lev'],
-                            margin=round(p.get('margin', p['sz']/max(p['lev'],1)), 2),
+                            margin=round(p.get('margin',p['sz']/max(p['lev'],1)),2),
                             pnl=round(p['pnl'],2),pnl_pct=round(p['pnl_pct'],2),
                             strat=p['strat'],reasons=p['reasons'],ind=p['ind'],
                             t0=p['t0'],conf=p['conf'],live=p.get('live',False),
                             klines=p['klines'][-30:])
-        pct = round(self.agent.total_pnl()/self.agent.start_balance*100, 2) if self.agent.start_balance > 0 else 0
-        # Cache'ten çek (30sn TTL), her state() çağrısında API vurmaz
-        acc = self.bc.fetch_account() if getattr(self.bc,'api_key',None) else None
-        unrealized = sum(p.get('pnl',0) for p in self.agent.positions.values())
-        # Canlı hesap varsa unrealized Binance'ten gelir, ayrıca göster
+        acc=self.bc.fetch_account()
+        unrealized=round(sum(p['pnl'] for p in self.agent.positions.values()),2)
         if acc and acc.get('unrealized') is not None:
-            unrealized = acc['unrealized']
+            unrealized=round(acc['unrealized'],2)
+        bal=round(self.agent.balance,2)
+        sb=round(self.agent.start_balance,2)
+        pct=round((bal-sb)/sb*100,2) if sb>0 else 0
         return dict(
-            balance=round(self.agent.balance,2),
-            start_balance=round(self.agent.start_balance,2),
-            unrealized_pnl=round(unrealized,2),
-            equity=round(self.agent.balance+unrealized,2),
+            balance=bal,
+            start_balance=sb,
+            unrealized_pnl=unrealized,
+            equity=round(bal+unrealized,2),
             total_pnl=self.agent.total_pnl(),
             total_pnl_pct=pct,
             trades=self.agent.trades,wins=self.agent.wins,
@@ -631,12 +540,10 @@ class Engine:
             curve=self.agent.pnl_curve,
             events=self.events[:60],
             conn=dict(
-                ok=self.bc.connected if hasattr(self.bc,'connected') else True,
                 has_key=bool(getattr(self.bc,'api_key',None)),
                 wallet=acc['wallet'] if acc else None,
-                unrealized=acc['unrealized'] if acc else None,
                 available=acc['available'] if acc else None,
-                api_err=getattr(self.bc,'_last_err',None),
+                unrealized=acc['unrealized'] if acc else None,
             ),
         )
 
@@ -879,56 +786,63 @@ header{background:var(--s1);border-bottom:1px solid var(--b);
 .tooltip{position:fixed;background:var(--s2);border:1px solid var(--b2);
   border-radius:3px;padding:6px 10px;font-size:10px;pointer-events:none;
   z-index:200;display:none;line-height:1.6}
-/* API MODAL */
-.am-ov{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:2000;
-  display:none;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
-.am-ov.show{display:flex}
-.am-box{background:var(--s1);border:1px solid var(--b2);border-radius:4px;width:440px;max-width:95vw}
-.am-head{padding:16px 20px;border-bottom:1px solid var(--b);display:flex;justify-content:space-between;align-items:center}
-.am-title{font-family:var(--display);font-size:20px;letter-spacing:3px;color:var(--cyan)}
-.am-body{padding:20px}
-.am-label{font-size:9px;letter-spacing:2px;color:var(--dim);text-transform:uppercase;margin-bottom:6px;display:block}
-.am-input{width:100%;background:var(--s2);border:1px solid var(--b2);border-radius:2px;
-  padding:10px 12px;color:var(--text);font-family:var(--mono);font-size:11px;outline:none;margin-bottom:14px}
-.am-input:focus{border-color:var(--cyan)}
-.am-note{font-size:10px;color:var(--dim);line-height:1.6;margin-bottom:16px;
-  background:rgba(0,212,255,.04);border:1px solid rgba(0,212,255,.1);border-radius:3px;padding:10px}
-.am-btns{display:flex;gap:10px}
-.am-btns .btn{flex:1;padding:10px}
-.am-status{font-size:11px;text-align:center;margin-top:10px;min-height:16px}
-/* CONN BAR */
-.conn-bar{background:var(--s1);border-bottom:1px solid var(--b);padding:5px 20px;
-  display:flex;align-items:center;gap:16px;font-size:10px;letter-spacing:.5px;flex-wrap:wrap}
-.conn-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
-.conn-dot.on{background:var(--green);box-shadow:0 0 5px var(--green)}
-.conn-dot.off{background:var(--red);box-shadow:0 0 5px var(--red)}
-.conn-sep{width:1px;height:12px;background:var(--b);flex-shrink:0}
-.conn-item{display:flex;align-items:center;gap:5px;color:var(--dim)}
-.conn-item b{color:var(--text)}
-.conn-btn{margin-left:auto;padding:3px 12px;border:1px solid var(--cyan);border-radius:2px;
-  background:none;color:var(--cyan);font-family:var(--mono);font-size:9px;font-weight:700;
-  letter-spacing:1.5px;cursor:pointer}
-.conn-btn:hover{background:rgba(0,212,255,.1)}
 </style>
 </head>
 <body>
 
 <!-- CONN BAR -->
-<div class="conn-bar" id="conn-bar">
-  <div class="conn-dot off" id="c-dot"></div>
-  <div class="conn-item" id="c-status">Bağlanıyor...</div>
-  <div class="conn-sep"></div>
-  <div class="conn-item">Bakiye: <b id="c-bal">--</b></div>
-  <div class="conn-sep"></div>
-  <div class="conn-item">Unrealized: <b id="c-unr">--</b></div>
-  <div class="conn-sep"></div>
-  <div class="conn-item" id="c-api-st" style="color:var(--yellow)">● API KEY GİRİLMEDİ</div>
-  <button class="conn-btn" onclick="openApiModal()">⚙ API AYARLA</button>
+<div style="background:#0a0f1a;border-bottom:1px solid #1a2744;padding:5px 20px;display:flex;align-items:center;gap:14px;font-size:10px;letter-spacing:.5px;flex-wrap:wrap">
+  <div style="display:flex;align-items:center;gap:6px">
+    <div id="c-dot" style="width:7px;height:7px;border-radius:50%;background:#ff3366"></div>
+    <span id="c-status" style="color:#4a6a8a">Bağlanıyor...</span>
+  </div>
+  <span style="color:#1a2744">|</span>
+  <span style="color:#4a6a8a">Bakiye: <b id="c-bal" style="color:#e0e8f0">--</b></span>
+  <span style="color:#1a2744">|</span>
+  <span style="color:#4a6a8a">Unrealized: <b id="c-unr" style="color:#e0e8f0">--</b></span>
+  <span style="color:#1a2744">|</span>
+  <span id="c-api" style="color:#f0b429">● API KEY GİRİLMEDİ</span>
+  <button onclick="document.getElementById('api-modal').style.display='flex'"
+    style="margin-left:auto;padding:3px 12px;border:1px solid #00d4ff;border-radius:2px;
+    background:none;color:#00d4ff;font-family:monospace;font-size:9px;font-weight:700;
+    letter-spacing:1.5px;cursor:pointer">⚙ API AYARLA</button>
 </div>
 
 <!-- TICKER -->
 <div class="ticker-wrap">
   <div class="ticker-inner" id="ticker"></div>
+</div>
+
+<!-- API MODAL -->
+<div id="api-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);
+  z-index:2000;align-items:center;justify-content:center">
+  <div style="background:#0d1421;border:1px solid #1a2744;border-radius:4px;width:420px;max-width:95vw;padding:24px">
+    <div style="font-family:'Orbitron',monospace;font-size:18px;letter-spacing:3px;color:#00d4ff;margin-bottom:16px">API BAĞLANTISI</div>
+    <div style="font-size:10px;color:#4a6a8a;line-height:1.7;margin-bottom:14px;
+      background:rgba(0,212,255,.04);border:1px solid rgba(0,212,255,.1);border-radius:3px;padding:10px">
+      <b>Binance Futures Testnet</b> API anahtarlarını gir.<br>
+      Anahtar: <b>testnet.binancefuture.com</b> → API Management
+    </div>
+    <div style="font-size:9px;letter-spacing:2px;color:#4a6a8a;margin-bottom:5px">API KEY</div>
+    <input id="am-key" type="text" placeholder="Testnet API Key..."
+      style="width:100%;background:#0a0f1a;border:1px solid #1a2744;border-radius:2px;
+      padding:9px 12px;color:#e0e8f0;font-family:monospace;font-size:11px;outline:none;
+      margin-bottom:12px;box-sizing:border-box">
+    <div style="font-size:9px;letter-spacing:2px;color:#4a6a8a;margin-bottom:5px">API SECRET</div>
+    <input id="am-sec" type="password" placeholder="Testnet API Secret..."
+      style="width:100%;background:#0a0f1a;border:1px solid #1a2744;border-radius:2px;
+      padding:9px 12px;color:#e0e8f0;font-family:monospace;font-size:11px;outline:none;
+      margin-bottom:16px;box-sizing:border-box">
+    <div style="display:flex;gap:10px">
+      <button onclick="saveApiKeys()"
+        style="flex:1;padding:10px;border:1px solid #00ff88;border-radius:2px;background:none;
+        color:#00ff88;font-family:monospace;font-size:10px;font-weight:700;letter-spacing:2px;cursor:pointer">✓ BAĞLAN</button>
+      <button onclick="document.getElementById('api-modal').style.display='none'"
+        style="flex:1;padding:10px;border:1px solid #ff3366;border-radius:2px;background:none;
+        color:#ff3366;font-family:monospace;font-size:10px;font-weight:700;letter-spacing:2px;cursor:pointer">✕ İPTAL</button>
+    </div>
+    <div id="am-st" style="font-size:11px;text-align:center;margin-top:10px;min-height:16px"></div>
+  </div>
 </div>
 
 <!-- HEADER -->
@@ -940,7 +854,7 @@ header{background:var(--s1);border-bottom:1px solid var(--b);
   <div class="hdr-center">
     <div class="stat-mini">
       <div class="stat-mini-l">Bakiye</div>
-      <div class="stat-mini-v c-cyan" id="hdr-balance">--</div>
+      <div class="stat-mini-v c-cyan" id="hdr-balance">$10,000</div>
     </div>
     <div style="width:1px;height:36px;background:var(--b)"></div>
     <div class="stat-mini">
@@ -963,37 +877,11 @@ header{background:var(--s1);border-bottom:1px solid var(--b);
 <!-- TOOLTIP -->
 <div class="tooltip" id="tt"></div>
 
-<!-- API MODAL -->
-<div class="am-ov" id="am-ov">
-  <div class="am-box">
-    <div class="am-head">
-      <div class="am-title">API BAĞLANTISI</div>
-      <button class="modal-close" onclick="closeApiModal()">✕</button>
-    </div>
-    <div class="am-body">
-      <div class="am-note">
-        <b>Binance Futures Testnet</b> API anahtarlarını gir.<br>
-        Anahtar oluştur: <b>testnet.binancefuture.com</b> → API Management<br>
-        Anahtarlar bu oturumda kullanılır, diske kaydedilmez.
-      </div>
-      <label class="am-label">API Key</label>
-      <input class="am-input" id="am-key" type="text" placeholder="Testnet API Key...">
-      <label class="am-label">API Secret</label>
-      <input class="am-input" id="am-sec" type="password" placeholder="Testnet API Secret...">
-      <div class="am-btns">
-        <button class="btn btn-go" onclick="saveApiKeys()">✓ BAĞLAN</button>
-        <button class="btn btn-stop" onclick="closeApiModal()">✕ İPTAL</button>
-      </div>
-      <div class="am-status" id="am-st"></div>
-    </div>
-  </div>
-</div>
-
 <div class="grid">
 
   <!-- STATS -->
   <div class="stats-area">
-    <div class="sc"><div class="sc-l">Portfoy</div><div class="sc-v c-cyan" id="s-bal">--</div><div class="sc-s" id="s-bal-sub">Baslangic: --</div></div>
+    <div class="sc"><div class="sc-l">Portfoy</div><div class="sc-v c-cyan" id="s-bal">$10,000</div><div class="sc-s">Baslangic: $10,000</div></div>
     <div class="sc"><div class="sc-l">Toplam PnL</div><div class="sc-v" id="s-pnl">$0</div><div class="sc-s" id="s-pnl-pct">0.00%</div></div>
     <div class="sc"><div class="sc-l">Toplam Trade</div><div class="sc-v c-purple" id="s-tr">0</div><div class="sc-s" id="s-wl">W:0 / L:0</div></div>
     <div class="sc"><div class="sc-l">Win Rate</div><div class="sc-v" id="s-wr">50%</div><div class="sc-s">Ogreniyor...</div></div>
@@ -1097,50 +985,40 @@ function startBot(){
 function stopBot(){
   fetch('/api/stop').then(()=>{running=false;syncUI()});
 }
-// ── CONN BAR ─────────────────────────────────────────────
-function updateConnBar(d){
-  const conn=d.conn||{};
-  const dot=document.getElementById('c-dot');
-  const st=document.getElementById('c-status');
-  if(conn.ok){dot.className='conn-dot on';st.innerHTML='<b style="color:var(--green)">BAĞLI</b> · Testnet';}
-  else{dot.className='conn-dot off';st.innerHTML='<b style="color:var(--red)">BAĞLANTI YOK</b>';}
-  const bal=conn.wallet;
-  const unr=conn.unrealized||0;
-  document.getElementById('c-bal').textContent=bal!=null?'$'+bal.toLocaleString('en-US',{minimumFractionDigits:2}):'--';
-  const unrEl=document.getElementById('c-unr');
-  if(bal!=null){
-    unrEl.textContent=(unr>=0?'+$':'-$')+Math.abs(unr).toFixed(2);
-    unrEl.style.color=unr>=0?'var(--green)':'var(--red)';
-  } else { unrEl.textContent='--'; }
-  const apiSt=document.getElementById('c-api-st');
-  if(conn.has_key&&bal!=null) apiSt.innerHTML='<span style="color:var(--green)">● API AKTİF</span>';
-  else if(conn.has_key) apiSt.innerHTML='<span style="color:var(--yellow)">● API BEKLENIYOR</span>';
-  else apiSt.innerHTML='<span style="color:var(--yellow)">● API KEY GİRİLMEDİ</span>';
-}
-
-// ── API MODAL ─────────────────────────────────────────────
-function openApiModal(){ document.getElementById('am-ov').classList.add('show'); }
-function closeApiModal(){ document.getElementById('am-ov').classList.remove('show'); }
 async function saveApiKeys(){
   const ak=document.getElementById('am-key').value.trim();
   const sk=document.getElementById('am-sec').value.trim();
   const st=document.getElementById('am-st');
-  if(!ak||!sk){st.innerHTML='<span style="color:var(--red)">Key ve Secret gerekli</span>';return;}
-  st.innerHTML='<span style="color:var(--yellow)">Bağlanılıyor...</span>';
+  if(!ak||!sk){st.innerHTML='<span style="color:#ff3366">Key ve Secret gerekli</span>';return;}
+  st.innerHTML='<span style="color:#f0b429">Bağlanılıyor...</span>';
   try{
     const r=await fetch('/api/setkeys',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({api_key:ak,api_secret:sk})});
     const d=await r.json();
-    if(d.ok&&d.balance>0){
-      st.innerHTML='<span style="color:var(--green)">✓ Bağlandı! Bakiye: $'+d.balance.toLocaleString('en-US',{minimumFractionDigits:2})+'</span>';
-      setTimeout(closeApiModal,1500);
+    if(d.ok){
+      st.innerHTML='<span style="color:#00ff88">✓ Bağlandı! Bakiye: $'+d.balance.toLocaleString('en-US',{minimumFractionDigits:2})+'</span>';
+      setTimeout(()=>{document.getElementById('api-modal').style.display='none';},1500);
     } else {
-      st.innerHTML='<span style="color:var(--red)">Hata: '+(d.err||'Bakiye alınamadı')+'</span>';
+      st.innerHTML='<span style="color:#ff3366">Hata: '+(d.err||'Bakiye alınamadı')+'</span>';
     }
-  }catch(e){st.innerHTML='<span style="color:var(--red)">Bağlantı hatası</span>';}
+  }catch(e){st.innerHTML='<span style="color:#ff3366">Bağlantı hatası</span>';}
 }
-
+function updateConn(d){
+  const conn=d.conn||{};
+  const dot=document.getElementById('c-dot');
+  const cst=document.getElementById('c-status');
+  dot.style.background='#00ff88'; cst.style.color='#00ff88'; cst.textContent='BAĞLI · Testnet';
+  const w=conn.wallet; const u=conn.unrealized||0;
+  document.getElementById('c-bal').textContent=w!=null?'$'+w.toLocaleString('en-US',{minimumFractionDigits:2}):'--';
+  const uel=document.getElementById('c-unr');
+  uel.textContent=w!=null?(u>=0?'+$':'-$')+Math.abs(u).toFixed(2):'--';
+  uel.style.color=u>=0?'#00ff88':'#ff3366';
+  const ap=document.getElementById('c-api');
+  if(conn.has_key&&w!=null) ap.innerHTML='<span style="color:#00ff88">● API AKTİF</span>';
+  else if(conn.has_key) ap.innerHTML='<span style="color:#f0b429">● API BEKLENIYOR</span>';
+  else ap.innerHTML='<span style="color:#f0b429">● API KEY GİRİLMEDİ</span>';
+}
 function syncUI(){
   const on=running;
   document.getElementById('status-pill').textContent=on?'CALISIYOR':'DURDURULDU';
@@ -1438,8 +1316,6 @@ function buildPositions(){
         <span>Anlik <b>$${f(p.cur)}</b></span>
         <span>Take Profit <b style="color:var(--green)">$${f(p.tp)}</b></span>
         <span>Stop Loss <b style="color:var(--red)">$${f(p.sl)}</b></span>
-        <span>Poz. Buyuklugu <b style="color:var(--cyan)">$${(p.sz||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</b></span>
-        <span>Marjin <b style="color:var(--yellow)">$${(p.margin||(p.sz/p.lev)||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</b></span>
       </div>
       <div class="prog-wrap">
         <div class="prog-labels">
@@ -1455,7 +1331,6 @@ function buildPositions(){
         <span class="chip${ind.rsi&&(ind.rsi<32||ind.rsi>68)?' warn':''}">RSI ${ind.rsi||'--'}</span>
         <span class="chip lit">Guven ${(p.conf||0).toFixed(0)}%</span>
         <span class="chip">${p.strat}</span>
-        <span class="chip" style="border-color:${p.live?'var(--green)':'var(--dim)'};color:${p.live?'var(--green)':'var(--dim)'};">${p.live?'● CANLI':'○ SIM'}</span>
         <span class="chip lit" onclick="showCandles('${sym}')" style="cursor:pointer">GRAFIK ▸</span>
       </div>
       <div class="pc-ai">
@@ -1531,20 +1406,13 @@ function buildStats(){
   const pct=data.total_pnl_pct||0;
   const wr=data.wr||50;
 
-  document.getElementById('hdr-balance').textContent=(equity>0)?'$'+equity.toLocaleString('en-US',{minimumFractionDigits:2}):'--';
-  document.getElementById('hdr-pnl').textContent=fPnl((data.total_pnl||0)+(unreal||0));
-  document.getElementById('hdr-pnl').className='stat-mini-v '+cl((data.total_pnl||0)+(unreal||0));
+  document.getElementById('hdr-balance').textContent='$'+(data.balance||0).toLocaleString('en-US',{minimumFractionDigits:2});
+  document.getElementById('hdr-pnl').textContent=fPnl(pnl);
+  document.getElementById('hdr-pnl').className='stat-mini-v '+cl(pnl);
   document.getElementById('hdr-wr').textContent=(wr).toFixed(1)+'%';
   document.getElementById('hdr-wr').className='stat-mini-v '+cl(wr-50);
 
-  const bal=data.balance||0;
-  const startBal=data.start_balance||0;
-  const equity=data.equity||bal;
-  const unreal=data.unrealized_pnl||0;
-  const dispBal=bal>0?'$'+bal.toLocaleString('en-US',{minimumFractionDigits:2}):'--';
-  document.getElementById('s-bal').textContent=dispBal;
-  const subEl=document.getElementById('s-bal-sub');
-  if(subEl) subEl.textContent=startBal>0?'Baslangic: $'+startBal.toLocaleString('en-US',{minimumFractionDigits:2}):'API bekleniyor';
+  document.getElementById('s-bal').textContent='$'+(data.balance||0).toLocaleString('en-US',{minimumFractionDigits:2});
   document.getElementById('s-pnl').textContent=fPnl(pnl);
   document.getElementById('s-pnl').className='sc-v '+cl(pnl);
   document.getElementById('s-pnl-pct').textContent=(pct>=0?'+':'')+pct+'%';
@@ -1673,7 +1541,7 @@ async function tick(){
 
     running=data.running||false;
     syncUI();
-    updateConnBar(data);
+    updateConn(data);
     buildStats();
     buildTicker();
     buildCoins();
@@ -1705,38 +1573,34 @@ engine_g = None
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
-            n = int(self.headers.get('Content-Length',0))
-            body = json.loads(self.rfile.read(n)) if n else {}
-            if self.path == '/api/setkeys':
-                ak = body.get('api_key','').strip()
-                sk = body.get('api_secret','').strip()
-                engine_g.bc.set_keys(ak, sk)
-                acc = engine_g.bc.fetch_account()
-                if acc and acc['wallet'] > 0:
-                    bal = acc['wallet']
-                    engine_g.agent.balance = bal
-                    if engine_g.agent.start_balance <= 0:
-                        engine_g.agent.start_balance = bal
-                        engine_g.agent.pnl_curve = [bal]
-                    engine_g.log(f"API baglandi | Bakiye: ${bal:,.2f}", "success")
-                    resp = {'ok': True, 'balance': bal}
+            n=int(self.headers.get('Content-Length',0))
+            body=json.loads(self.rfile.read(n)) if n else {}
+            if self.path=='/api/setkeys':
+                ak=body.get('api_key','').strip()
+                sk=body.get('api_secret','').strip()
+                engine_g.bc.set_keys(ak,sk)
+                acc=engine_g.bc.fetch_account(force=True)
+                if acc and acc['wallet']>0:
+                    engine_g.agent.balance=acc['wallet']
+                    engine_g.agent.start_balance=acc['wallet']
+                    engine_g.agent.pnl_curve=[acc['wallet']]
+                    engine_g.log(f"API baglandi | Bakiye: ${acc['wallet']:,.2f}","success")
+                    resp={'ok':True,'balance':acc['wallet']}
                 else:
-                    err = getattr(engine_g.bc, '_last_err', 'Hata')
-                    engine_g.log(f"API hatasi: {err}", "error")
-                    resp = {'ok': False, 'balance': 0, 'err': str(err)}
+                    err=getattr(engine_g.bc,'_last_err','Hata')
+                    engine_g.log(f"API hatasi: {err}","error")
+                    resp={'ok':False,'balance':0,'err':str(err)}
             else:
-                resp = {'ok': False}
-            payload = json.dumps(resp).encode()
+                resp={'ok':False}
+            payload=json.dumps(resp).encode()
             self.send_response(200)
             self.send_header('Content-type','application/json')
-            self.send_header('Content-Length', str(len(payload)))
             self.send_header('Access-Control-Allow-Origin','*')
             self.end_headers()
             self.wfile.write(payload)
         except BrokenPipeError: pass
         except Exception as e:
             print(f"POST err: {e}")
-
     def do_GET(self):
         try:
             if self.path=='/':
