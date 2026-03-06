@@ -38,7 +38,7 @@ class BinanceClient:
                    and s['status']=='TRADING'}
             self.symbols=[s for s in PRIORITY if s in valid]
             rest=[s for s in valid if s not in self.symbols]
-            self.symbols+=rest[:20]
+            self.symbols+=rest  # tüm coinler
             print(f"✓ {len(self.symbols)} pairs loaded")
         except Exception as e:
             print(f"symbols error: {e}")
@@ -47,9 +47,10 @@ class BinanceClient:
     def _fetch_tickers(self):
         try:
             r=requests.get(f"{self.BASE}/fapi/v1/ticker/24hr",timeout=10)
+            sym_set=set(self.symbols)
             for t in r.json():
                 s=t['symbol']
-                if s in self.symbols:
+                if s in sym_set:
                     self.ticker[s]={
                         'price':float(t['lastPrice']),
                         'change':float(t['priceChangePercent']),
@@ -77,17 +78,29 @@ class BinanceClient:
     def refresh_tickers(self):
         try:
             r=requests.get(f"{self.BASE}/fapi/v1/ticker/24hr",timeout=10)
+            sym_set=set(self.symbols)
             for t in r.json():
                 s=t['symbol']
-                if s in self.symbols:
-                    self.ticker[s].update({
-                        'price':float(t['lastPrice']),
-                        'change':float(t['priceChangePercent']),
-                        'volume':float(t['volume']),
-                        'high':float(t['highPrice']),
-                        'low':float(t['lowPrice']),
-                    })
-                    self.prices[s]=float(t['lastPrice'])
+                if s in sym_set:
+                    price=float(t['lastPrice'])
+                    self.prices[s]=price
+                    if s in self.ticker:
+                        self.ticker[s].update({
+                            'price':price,
+                            'change':float(t['priceChangePercent']),
+                            'volume':float(t['volume']),
+                            'high':float(t['highPrice']),
+                            'low':float(t['lowPrice']),
+                        })
+                    else:
+                        self.ticker[s]={
+                            'price':price,
+                            'change':float(t['priceChangePercent']),
+                            'volume':float(t['volume']),
+                            'high':float(t['highPrice']),
+                            'low':float(t['lowPrice']),
+                            'quoteVolume':float(t.get('quoteVolume',0)),
+                        }
         except: pass
 
     def klines(self, symbol, interval='5m', limit=60):
@@ -114,25 +127,37 @@ class BinanceClient:
         params['signature'] = sig
         return params
 
-    def fetch_account(self):
-        """Bakiye ve unrealized PNL çek"""
+    def fetch_account(self, force=False):
+        """Bakiye ve unrealized PNL çek — 30sn cache"""
         if not getattr(self,'api_key',None) or not getattr(self,'api_secret',None):
             return None
+        # Cache: 30 saniyede bir gerçekten çek
+        now = time.time()
+        if not force and getattr(self,'_acc_cache',None) and now - self._acc_cache_ts < 30:
+            return self._acc_cache
         try:
-            ts = int(time.time()*1000)
+            ts = int(now*1000)
             params = self._sign({'timestamp':ts,'recvWindow':5000})
             headers = {'X-MBX-APIKEY': self.api_key}
             r = requests.get(f"{self.BASE}/fapi/v2/account", params=params, headers=headers, timeout=10)
             d = r.json()
             if 'totalWalletBalance' in d:
-                return {
-                    'wallet':   float(d['totalWalletBalance']),
-                    'available':float(d.get('availableBalance', d['totalWalletBalance'])),
+                result = {
+                    'wallet':    float(d['totalWalletBalance']),
+                    'available': float(d.get('availableBalance', d['totalWalletBalance'])),
                     'unrealized':float(d.get('totalUnrealizedProfit', 0)),
                 }
+                self._acc_cache = result
+                self._acc_cache_ts = now
+                print(f"[BAL] wallet={result['wallet']:.2f} avail={result['available']:.2f} unreal={result['unrealized']:.2f}")
+                return result
+            else:
+                self._last_err = d.get('msg','?')
+                print(f"[ACCOUNT ERR] {d.get('msg','?')}")
         except Exception as e:
+            self._last_err = str(e)
             print(f"[ACCOUNT ERR] {e}")
-        return None
+        return getattr(self,'_acc_cache',None)  # hata varsa eski cache dön
 
     def place_order(self, symbol, side, usdt_amount, leverage):
         """Market emri aç. usdt_amount = marjin tutarı (kaldıraçsız)"""
@@ -212,6 +237,35 @@ class BinanceClient:
                     return abs(float(p.get('positionAmt', 0)))
         except: pass
         return 0
+
+    def fetch_live_pnl(self, force=False):
+        """Tüm açık pozisyonların gerçek PNL verisi — 10sn cache"""
+        if not getattr(self,'api_key',None): return {}
+        now = time.time()
+        if not force and getattr(self,'_pnl_cache',None) and now - self._pnl_cache_ts < 10:
+            return self._pnl_cache
+        try:
+            ts = int(now*1000)
+            params = self._sign({'timestamp':ts,'recvWindow':5000})
+            r = requests.get(f"{self.BASE}/fapi/v2/positionRisk", params=params,
+                             headers={'X-MBX-APIKEY':self.api_key}, timeout=10)
+            result = {}
+            for p in r.json():
+                amt = float(p.get('positionAmt', 0))
+                if abs(amt) > 0:
+                    result[p['symbol']] = {
+                        'qty':        abs(amt),
+                        'entry':      float(p.get('entryPrice', 0)),
+                        'mark':       float(p.get('markPrice', 0)),
+                        'pnl':        float(p.get('unRealizedProfit', 0)),
+                        'leverage':   int(p.get('leverage', 1)),
+                    }
+            self._pnl_cache = result
+            self._pnl_cache_ts = now
+            return result
+        except Exception as e:
+            print(f"[PNL FETCH ERR] {e}")
+        return getattr(self,'_pnl_cache',{})
 
 # ── TECHNICAL ANALYSIS ───────────────────────────────────────
 class TA:
@@ -385,27 +439,50 @@ class Agent:
 
     def update(self):
         close=[]
+        # Canlı pozisyon varsa Binance'ten gerçek PNL çek
+        has_live = any(p.get('live') for p in self.positions.values())
+        live_data = self.bc.fetch_live_pnl() if has_live else {}
+
         for sym,pos in self.positions.items():
             try:
                 p=self.bc.price(sym)
                 if p==0: continue
                 pos['cur']=p
-                m=pos['lev']
-                if pos['type']=='LONG':
-                    pct=(p-pos['entry'])/pos['entry']*100*m
+
+                if pos.get('live') and sym in live_data:
+                    # Gerçek Binance verisi kullan
+                    ld = live_data[sym]
+                    pnl = ld['pnl']
+                    # entry fiyatı Binance'ten güncelle
+                    if ld['entry'] > 0: pos['entry'] = ld['entry']
+                    mark = ld['mark'] if ld['mark'] > 0 else p
+                    pos['cur'] = mark
+                    sz = pos['sz']
+                    pct = (pnl / sz * 100) if sz > 0 else 0
                 else:
-                    pct=(pos['entry']-p)/pos['entry']*100*m
-                pnl=pos['sz']*pct/100
-                pos['pnl']=pnl; pos['pnl_pct']=pct
+                    # Simülasyon: yerel hesapla
+                    m=pos['lev']
+                    if pos['type']=='LONG':
+                        pct=(p-pos['entry'])/pos['entry']*100*m
+                    else:
+                        pct=(pos['entry']-p)/pos['entry']*100*m
+                    pnl=pos['sz']*pct/100
+
+                pos['pnl']=round(pnl,4)
+                pos['pnl_pct']=round(pct,4)
                 pos['max_pnl']=max(pos['max_pnl'],pnl)
                 pos['min_pnl']=min(pos['min_pnl'],pnl)
+
+                # TP/SL kontrolü
+                cur = pos['cur']
                 if pos['type']=='LONG':
-                    if p>=pos['tp']: close.append((sym,'TP'))
-                    elif p<=pos['sl']: close.append((sym,'SL'))
+                    if cur>=pos['tp']: close.append((sym,'TP'))
+                    elif cur<=pos['sl']: close.append((sym,'SL'))
                 else:
-                    if p<=pos['tp']: close.append((sym,'TP'))
-                    elif p>=pos['sl']: close.append((sym,'SL'))
-            except: pass
+                    if cur<=pos['tp']: close.append((sym,'TP'))
+                    elif cur>=pos['sl']: close.append((sym,'SL'))
+            except Exception as e:
+                print(f"[UPDATE ERR] {sym}: {e}")
         for sym,why in close: self.close(sym,why)
 
     def close(self,sym,why='Manual'):
@@ -418,10 +495,12 @@ class Agent:
                 qty = self.bc.get_position_qty(sym)
                 if qty > 0:
                     self.bc.close_order(sym, pos['type'], qty)
-                # Kapandıktan sonra gerçek bakiyeyi çek
-                acc = self.bc.fetch_account()
+                # Kapandıktan sonra gerçek bakiyeyi force çek
+                time.sleep(1)  # emrin işlenmesi için bekle
+                acc = self.bc.fetch_account(force=True)
                 if acc and acc['wallet'] > 0:
                     self.balance = acc['wallet']
+                    self.start_balance = self.start_balance or acc['wallet']
                 else:
                     self.balance += pos['pnl']
             except Exception as e:
@@ -485,6 +564,13 @@ class Engine:
                         if d and len(self.agent.positions)<6:
                             self.agent.open(d)
                             self.log(f"{s} {d['action']} @ ${d['price']:.4f} | Guven {d['conf']:.0f}% | {', '.join(d['reasons'][:2])}","trade")
+                # Her 60 tickte bir (~3 dakika) bakiyeyi Binance'ten güncelle
+                if self.tick%60==0 and getattr(self.bc,'api_key',None):
+                    acc = self.bc.fetch_account(force=True)
+                    if acc and acc['wallet'] > 0:
+                        live_count = sum(1 for p in self.agent.positions.values() if p.get('live'))
+                        if live_count == 0:
+                            self.agent.balance = acc['wallet']
                 self.tick+=1
                 time.sleep(3)
             except Exception as e:
@@ -507,8 +593,10 @@ class Engine:
         coins={}
         for s in self.bc.symbols:
             t=self.bc.info(s)
-            coins[s]=dict(price=t.get('price',0),change=round(t.get('change',0),2),
-                          volume=t.get('volume',0),high=t.get('high',0),low=t.get('low',0))
+            pr=t.get('price',0)
+            if pr>0:   # fiyatı olan coinleri gönder
+                coins[s]=dict(price=pr,change=round(t.get('change',0),2),
+                              volume=t.get('volume',0),high=t.get('high',0),low=t.get('low',0))
         pos_out={}
         for s,p in self.agent.positions.items():
             pos_out[s]=dict(type=p['type'],entry=p['entry'],cur=p['cur'],
@@ -519,9 +607,12 @@ class Engine:
                             t0=p['t0'],conf=p['conf'],live=p.get('live',False),
                             klines=p['klines'][-30:])
         pct = round(self.agent.total_pnl()/self.agent.start_balance*100, 2) if self.agent.start_balance > 0 else 0
-        # Gerçek bakiye ve unrealized PNL
+        # Cache'ten çek (30sn TTL), her state() çağrısında API vurmaz
         acc = self.bc.fetch_account() if getattr(self.bc,'api_key',None) else None
-        unrealized = sum(p['pnl'] for p in self.agent.positions.values())
+        unrealized = sum(p.get('pnl',0) for p in self.agent.positions.values())
+        # Canlı hesap varsa unrealized Binance'ten gelir, ayrıca göster
+        if acc and acc.get('unrealized') is not None:
+            unrealized = acc['unrealized']
         return dict(
             balance=round(self.agent.balance,2),
             start_balance=round(self.agent.start_balance,2),
@@ -1440,14 +1531,20 @@ function buildStats(){
   const pct=data.total_pnl_pct||0;
   const wr=data.wr||50;
 
-  document.getElementById('hdr-balance').textContent='$'+(data.balance||0).toLocaleString('en-US',{minimumFractionDigits:2});
-  document.getElementById('hdr-pnl').textContent=fPnl(pnl);
-  document.getElementById('hdr-pnl').className='stat-mini-v '+cl(pnl);
+  document.getElementById('hdr-balance').textContent=(equity>0)?'$'+equity.toLocaleString('en-US',{minimumFractionDigits:2}):'--';
+  document.getElementById('hdr-pnl').textContent=fPnl((data.total_pnl||0)+(unreal||0));
+  document.getElementById('hdr-pnl').className='stat-mini-v '+cl((data.total_pnl||0)+(unreal||0));
   document.getElementById('hdr-wr').textContent=(wr).toFixed(1)+'%';
   document.getElementById('hdr-wr').className='stat-mini-v '+cl(wr-50);
 
-  const dispBal=(data.balance||0)>0?'$'+(data.balance||0).toLocaleString('en-US',{minimumFractionDigits:2}):'--';
+  const bal=data.balance||0;
+  const startBal=data.start_balance||0;
+  const equity=data.equity||bal;
+  const unreal=data.unrealized_pnl||0;
+  const dispBal=bal>0?'$'+bal.toLocaleString('en-US',{minimumFractionDigits:2}):'--';
   document.getElementById('s-bal').textContent=dispBal;
+  const subEl=document.getElementById('s-bal-sub');
+  if(subEl) subEl.textContent=startBal>0?'Baslangic: $'+startBal.toLocaleString('en-US',{minimumFractionDigits:2}):'API bekleniyor';
   document.getElementById('s-pnl').textContent=fPnl(pnl);
   document.getElementById('s-pnl').className='sc-v '+cl(pnl);
   document.getElementById('s-pnl-pct').textContent=(pct>=0?'+':'')+pct+'%';
