@@ -8,12 +8,69 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # ── BINANCE CLIENT ────────────────────────────────────────────
 class BinanceClient:
     BASE = "https://testnet.binancefuture.com"
-    def __init__(self):
+    def __init__(self, api_key="", api_secret=""):
+        self.api_key=api_key
+        self.api_secret=api_secret
         self.symbols=[]
         self.ticker={}
         self.prices={}
+        self.connected=False
+        self.last_ping=None
+        self.ping_ms=None
+        self.server_time=None
+        self.account_balance=None
+        self.balance_asset="USDT"
+        self.api_error=None
         self._fetch_symbols()
         self._fetch_tickers()
+        self.ping()
+
+    def _sign(self, params):
+        import hmac, hashlib, urllib.parse
+        query=urllib.parse.urlencode(params)
+        sig=hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        params['signature']=sig
+        return params
+
+    def fetch_balance(self):
+        if not self.api_key or not self.api_secret:
+            self.api_error="API Key / Secret girilmedi"
+            return None
+        try:
+            ts=int(time.time()*1000)
+            params=self._sign({'timestamp':ts,'recvWindow':5000})
+            headers={'X-MBX-APIKEY':self.api_key}
+            r=requests.get(f"{self.BASE}/fapi/v2/balance",params=params,headers=headers,timeout=10)
+            data=r.json()
+            if isinstance(data,list):
+                for asset in data:
+                    if asset.get('asset')=='USDT':
+                        self.account_balance=float(asset.get('availableBalance',0))
+                        self.api_error=None
+                        return self.account_balance
+                self.api_error="USDT bakiyesi bulunamadi"
+            else:
+                self.api_error=data.get('msg','Bilinmeyen hata')
+            return None
+        except Exception as e:
+            self.api_error=f"Baglanti hatasi: {e}"
+            return None
+
+    def ping(self):
+        try:
+            t0=time.time()
+            r=requests.get(f"{self.BASE}/fapi/v1/ping",timeout=5)
+            ms=round((time.time()-t0)*1000)
+            tr=requests.get(f"{self.BASE}/fapi/v1/time",timeout=5)
+            self.server_time=tr.json().get('serverTime')
+            self.ping_ms=ms
+            self.connected=r.status_code==200
+            self.last_ping=datetime.now().strftime('%H:%M:%S')
+            if self.api_key and self.api_secret:
+                self.fetch_balance()
+        except:
+            self.connected=False
+            self.ping_ms=None
 
     def _fetch_symbols(self):
         PRIORITY=['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT',
@@ -37,8 +94,8 @@ class BinanceClient:
                    and s['contractType']=='PERPETUAL'
                    and s['status']=='TRADING'}
             self.symbols=[s for s in PRIORITY if s in valid]
-            rest=[s for s in valid if s not in self.symbols]
-            self.symbols+=rest[:20]
+            rest=sorted([s for s in valid if s not in self.symbols])
+            self.symbols+=rest
             print(f"✓ {len(self.symbols)} pairs loaded")
         except Exception as e:
             print(f"symbols error: {e}")
@@ -147,13 +204,16 @@ class TA:
 class Agent:
     def __init__(self,bc):
         self.bc=bc
-        self.balance=10000
-        self.start_balance=10000
+        # Testnet bakiyesini çek, yoksa 0 ile başla
+        fetched=bc.fetch_balance()
+        start=fetched if fetched and fetched>0 else 0.0
+        self.balance=start
+        self.start_balance=start
         self.positions={}
         self.history=[]
         self.trades=0
         self.wins=0
-        self.pnl_curve=[10000]
+        self.pnl_curve=[start]
         self.strategies={'Trend Following':1.0,'Mean Reversion':1.0,'Breakout':1.0,'Scalping':1.0}
         self._klines_cache={}
 
@@ -312,9 +372,12 @@ class Agent:
 
 # ── ENGINE ────────────────────────────────────────────────────
 class Engine:
-    def __init__(self):
-        print("Connecting to Binance...")
-        self.bc=BinanceClient()
+    def __init__(self, api_key="", api_secret=""):
+        import os
+        self.api_key=api_key or os.environ.get('BINANCE_API_KEY','')
+        self.api_secret=api_secret or os.environ.get('BINANCE_API_SECRET','')
+        print("Connecting to Binance Testnet...")
+        self.bc=BinanceClient(self.api_key, self.api_secret)
         self.agent=Agent(self.bc)
         self.running=False
         self.tick=0
@@ -329,6 +392,7 @@ class Engine:
         self.log("Bot baslatildi","success")
         threading.Thread(target=self._bg_prices,daemon=True).start()
         threading.Thread(target=self._bg_tickers,daemon=True).start()
+        threading.Thread(target=self._bg_ping,daemon=True).start()
         print(f"\n{'─'*50}\nBot Started | ${self.agent.balance:.0f} | {len(self.bc.symbols)} pairs\n{'─'*50}\n")
         while self.running:
             try:
@@ -358,6 +422,10 @@ class Engine:
         while self.running:
             self.bc.refresh_tickers(); time.sleep(25)
 
+    def _bg_ping(self):
+        while self.running:
+            self.bc.ping(); time.sleep(30)
+
     def state(self):
         coins={}
         for s in self.bc.symbols:
@@ -372,10 +440,14 @@ class Engine:
                             strat=p['strat'],reasons=p['reasons'],ind=p['ind'],
                             t0=p['t0'],conf=p['conf'],
                             klines=p['klines'][-30:])
+        pct=0
+        if self.agent.start_balance>0:
+            pct=round(self.agent.total_pnl()/self.agent.start_balance*100,2)
         return dict(
             balance=round(self.agent.balance,2),
+            start_balance=round(self.agent.start_balance,2),
             total_pnl=self.agent.total_pnl(),
-            total_pnl_pct=round(self.agent.total_pnl()/self.agent.start_balance*100,2),
+            total_pnl_pct=pct,
             trades=self.agent.trades,wins=self.agent.wins,
             wr=round(self.agent.wr(),1),
             active=len(self.agent.positions),
@@ -386,6 +458,15 @@ class Engine:
             running=self.running,
             curve=self.agent.pnl_curve,
             events=self.events[:60],
+            connection=dict(
+                connected=self.bc.connected,
+                ping_ms=self.bc.ping_ms,
+                last_ping=self.bc.last_ping,
+                base=self.bc.BASE,
+                account_balance=self.bc.account_balance,
+                api_error=self.bc.api_error,
+                has_key=bool(self.bc.api_key),
+            ),
         )
 
 # ── HTML ─────────────────────────────────────────────────────
@@ -627,6 +708,49 @@ header{background:var(--s1);border-bottom:1px solid var(--b);
 .tooltip{position:fixed;background:var(--s2);border:1px solid var(--b2);
   border-radius:3px;padding:6px 10px;font-size:10px;pointer-events:none;
   z-index:200;display:none;line-height:1.6}
+
+/* CONNECTION BAR */
+.conn-bar{background:var(--s1);border-bottom:1px solid var(--b);
+  padding:6px 24px;display:flex;align-items:center;gap:20px;font-size:10px;
+  letter-spacing:.5px}
+.conn-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-right:2px}
+.conn-dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+.conn-dot.off{background:var(--red);box-shadow:0 0 6px var(--red)}
+.conn-dot.warn{background:var(--yellow);box-shadow:0 0 6px var(--yellow)}
+.conn-item{display:flex;align-items:center;gap:6px;color:var(--dim)}
+.conn-item b{color:var(--text)}
+.conn-sep{width:1px;height:14px;background:var(--b)}
+.conn-err{color:var(--red);font-size:10px}
+.btn-api{padding:4px 12px;border:1px solid var(--cyan);border-radius:2px;
+  background:none;color:var(--cyan);font-family:var(--mono);font-size:9px;
+  font-weight:700;letter-spacing:1.5px;cursor:pointer;transition:.15s;margin-left:auto}
+.btn-api:hover{background:rgba(0,212,255,.1)}
+
+/* API MODAL */
+.api-modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.85);
+  z-index:2000;display:none;align-items:center;justify-content:center;
+  backdrop-filter:blur(6px)}
+.api-modal-overlay.show{display:flex}
+.api-modal{background:var(--s1);border:1px solid var(--b2);border-radius:4px;
+  width:460px;max-width:95vw;padding:0}
+.api-modal-head{padding:18px 22px;border-bottom:1px solid var(--b);
+  display:flex;justify-content:space-between;align-items:center}
+.api-modal-title{font-family:var(--display);font-size:20px;letter-spacing:3px;color:var(--cyan)}
+.api-modal-body{padding:22px}
+.api-field{margin-bottom:16px}
+.api-field label{display:block;font-size:9px;letter-spacing:2px;color:var(--dim);
+  text-transform:uppercase;margin-bottom:6px}
+.api-input{width:100%;background:var(--s2);border:1px solid var(--b2);border-radius:2px;
+  padding:10px 12px;color:var(--text);font-family:var(--mono);font-size:11px;
+  outline:none;transition:.15s;letter-spacing:.5px}
+.api-input:focus{border-color:var(--cyan)}
+.api-note{font-size:10px;color:var(--dim);line-height:1.6;margin-bottom:18px;
+  background:rgba(0,212,255,.04);border:1px solid rgba(0,212,255,.1);
+  border-radius:3px;padding:10px 12px}
+.api-note a{color:var(--cyan);text-decoration:none}
+.api-status{font-size:10px;margin-top:10px;min-height:16px;text-align:center}
+.api-btns{display:flex;gap:10px;margin-top:4px}
+.api-btns .btn{flex:1;padding:10px}
 </style>
 </head>
 <body>
@@ -634,6 +758,25 @@ header{background:var(--s1);border-bottom:1px solid var(--b);
 <!-- TICKER -->
 <div class="ticker-wrap">
   <div class="ticker-inner" id="ticker"></div>
+</div>
+
+<!-- CONNECTION BAR -->
+<div class="conn-bar" id="conn-bar">
+  <div class="conn-item">
+    <div class="conn-dot off" id="conn-dot"></div>
+    <span id="conn-status-txt">Baglaniyor...</span>
+  </div>
+  <div class="conn-sep"></div>
+  <div class="conn-item">Sunucu: <b id="conn-base">--</b></div>
+  <div class="conn-sep"></div>
+  <div class="conn-item">Ping: <b id="conn-ping">--</b></div>
+  <div class="conn-sep"></div>
+  <div class="conn-item">Son kontrol: <b id="conn-last">--</b></div>
+  <div class="conn-sep"></div>
+  <div class="conn-item">Demo Bakiye: <b id="conn-balance" style="color:var(--cyan)">--</b></div>
+  <div class="conn-sep"></div>
+  <div class="conn-item" id="conn-api-status"></div>
+  <button class="btn-api" onclick="openApiModal()">⚙ API AYARLA</button>
 </div>
 
 <!-- HEADER -->
@@ -645,7 +788,7 @@ header{background:var(--s1);border-bottom:1px solid var(--b);
   <div class="hdr-center">
     <div class="stat-mini">
       <div class="stat-mini-l">Bakiye</div>
-      <div class="stat-mini-v c-cyan" id="hdr-balance">$10,000</div>
+      <div class="stat-mini-v c-cyan" id="hdr-balance">--</div>
     </div>
     <div style="width:1px;height:36px;background:var(--b)"></div>
     <div class="stat-mini">
@@ -668,11 +811,41 @@ header{background:var(--s1);border-bottom:1px solid var(--b);
 <!-- TOOLTIP -->
 <div class="tooltip" id="tt"></div>
 
+<!-- API MODAL -->
+<div class="api-modal-overlay" id="api-modal">
+  <div class="api-modal">
+    <div class="api-modal-head">
+      <div class="api-modal-title">API BAGLANTISI</div>
+      <button class="modal-close" onclick="closeApiModal()">✕</button>
+    </div>
+    <div class="api-modal-body">
+      <div class="api-note">
+        Binance Futures <b>Testnet</b> API anahtarlarınızı girin.<br>
+        Anahtarları <a href="https://testnet.binancefuture.com" target="_blank">testnet.binancefuture.com</a> adresinden oluşturabilirsiniz.<br>
+        Anahtarlar yalnızca bu oturumda saklanır, sunucuya kaydedilmez.
+      </div>
+      <div class="api-field">
+        <label>API Key</label>
+        <input class="api-input" id="api-key-input" type="text" placeholder="Testnet API Key...">
+      </div>
+      <div class="api-field">
+        <label>API Secret</label>
+        <input class="api-input" id="api-secret-input" type="password" placeholder="Testnet API Secret...">
+      </div>
+      <div class="api-btns">
+        <button class="btn btn-go" onclick="saveApiKeys()">✓ BAGLAN</button>
+        <button class="btn btn-stop" onclick="closeApiModal()">✕ IPTAL</button>
+      </div>
+      <div class="api-status" id="api-modal-status"></div>
+    </div>
+  </div>
+</div>
+
 <div class="grid">
 
   <!-- STATS -->
   <div class="stats-area">
-    <div class="sc"><div class="sc-l">Portfoy</div><div class="sc-v c-cyan" id="s-bal">$10,000</div><div class="sc-s">Baslangic: $10,000</div></div>
+    <div class="sc"><div class="sc-l">Portfoy</div><div class="sc-v c-cyan" id="s-bal">--</div><div class="sc-s" id="s-bal-start">Baslangic: --</div></div>
     <div class="sc"><div class="sc-l">Toplam PnL</div><div class="sc-v" id="s-pnl">$0</div><div class="sc-s" id="s-pnl-pct">0.00%</div></div>
     <div class="sc"><div class="sc-l">Toplam Trade</div><div class="sc-v c-purple" id="s-tr">0</div><div class="sc-s" id="s-wl">W:0 / L:0</div></div>
     <div class="sc"><div class="sc-l">Win Rate</div><div class="sc-v" id="s-wr">50%</div><div class="sc-s">Ogreniyor...</div></div>
@@ -1164,14 +1337,18 @@ function buildStats(){
   const pnl=data.total_pnl||0;
   const pct=data.total_pnl_pct||0;
   const wr=data.wr||50;
+  const bal=data.balance||0;
+  const startBal=data.start_balance||0;
 
-  document.getElementById('hdr-balance').textContent='$'+(data.balance||0).toLocaleString('en-US',{minimumFractionDigits:2});
+  const fmtBal=v=>v>0?'$'+v.toLocaleString('en-US',{minimumFractionDigits:2}):'--';
+  document.getElementById('hdr-balance').textContent=fmtBal(bal);
   document.getElementById('hdr-pnl').textContent=fPnl(pnl);
   document.getElementById('hdr-pnl').className='stat-mini-v '+cl(pnl);
   document.getElementById('hdr-wr').textContent=(wr).toFixed(1)+'%';
   document.getElementById('hdr-wr').className='stat-mini-v '+cl(wr-50);
 
-  document.getElementById('s-bal').textContent='$'+(data.balance||0).toLocaleString('en-US',{minimumFractionDigits:2});
+  document.getElementById('s-bal').textContent=fmtBal(bal);
+  document.getElementById('s-bal-start').textContent='Baslangic: '+(startBal>0?'$'+startBal.toLocaleString('en-US',{minimumFractionDigits:2}):'API bekleniyor');
   document.getElementById('s-pnl').textContent=fPnl(pnl);
   document.getElementById('s-pnl').className='sc-v '+cl(pnl);
   document.getElementById('s-pnl-pct').textContent=(pct>=0?'+':'')+pct+'%';
@@ -1180,6 +1357,61 @@ function buildStats(){
   document.getElementById('s-wr').textContent=wr.toFixed(1)+'%';
   document.getElementById('s-wr').className='sc-v '+cl(wr-50);
   document.getElementById('s-act').textContent=(data.active||0)+'/6';
+
+  // Connection bar
+  const conn=data.connection||{};
+  const dot=document.getElementById('conn-dot');
+  const stxt=document.getElementById('conn-status-txt');
+  if(conn.connected){
+    dot.className='conn-dot on';
+    stxt.innerHTML='<b style="color:var(--green)">BAGLI</b> · Binance Testnet';
+  } else {
+    dot.className='conn-dot off';
+    stxt.innerHTML='<b style="color:var(--red)">BAGLANTI YOK</b>';
+  }
+  document.getElementById('conn-base').textContent=conn.base?conn.base.replace('https://',''):'--';
+  document.getElementById('conn-ping').textContent=conn.ping_ms!=null?conn.ping_ms+'ms':'--';
+  document.getElementById('conn-last').textContent=conn.last_ping||'--';
+  const apiStat=document.getElementById('conn-api-status');
+  if(conn.has_key && conn.account_balance!=null){
+    document.getElementById('conn-balance').textContent='$'+conn.account_balance.toLocaleString('en-US',{minimumFractionDigits:2});
+    apiStat.innerHTML='<span style="color:var(--green)">● API AKTIF</span>';
+  } else if(conn.has_key && conn.api_error){
+    document.getElementById('conn-balance').textContent='HATA';
+    apiStat.innerHTML='<span style="color:var(--red)">● '+conn.api_error+'</span>';
+  } else {
+    document.getElementById('conn-balance').textContent='--';
+    apiStat.innerHTML='<span style="color:var(--yellow)">● API KEY GİRİLMEDİ</span>';
+  }
+}
+
+// ── API MODAL ─────────────────────────────────────────────
+function openApiModal(){
+  document.getElementById('api-modal').classList.add('show');
+}
+function closeApiModal(){
+  document.getElementById('api-modal').classList.remove('show');
+}
+async function saveApiKeys(){
+  const ak=document.getElementById('api-key-input').value.trim();
+  const sk=document.getElementById('api-secret-input').value.trim();
+  const st=document.getElementById('api-modal-status');
+  if(!ak||!sk){st.innerHTML='<span style="color:var(--red)">API Key ve Secret gerekli</span>';return;}
+  st.innerHTML='<span style="color:var(--yellow)">Baglaniliyor...</span>';
+  try{
+    const r=await fetch('/api/setkeys',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({api_key:ak,api_secret:sk})});
+    const d=await r.json();
+    if(d.status==='ok'||d.balance!=null){
+      st.innerHTML='<span style="color:var(--green)">✓ Baglandi! Bakiye: $'+d.balance.toLocaleString('en-US',{minimumFractionDigits:2})+'</span>';
+      setTimeout(closeApiModal,1500);
+    } else {
+      st.innerHTML='<span style="color:var(--red)">Hata: '+d.status+'</span>';
+    }
+  }catch(e){
+    st.innerHTML='<span style="color:var(--red)">Baglanti hatasi</span>';
+  }
 }
 
 // ── CHART MODE ────────────────────────────────────────────
@@ -1329,6 +1561,35 @@ window.addEventListener('resize',()=>{
 engine_g = None
 
 class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        try:
+            length=int(self.headers.get('Content-Length',0))
+            body=json.loads(self.rfile.read(length))
+            if self.path=='/api/setkeys':
+                ak=body.get('api_key','').strip()
+                sk=body.get('api_secret','').strip()
+                engine_g.bc.api_key=ak
+                engine_g.bc.api_secret=sk
+                engine_g.api_key=ak
+                engine_g.api_secret=sk
+                bal=engine_g.bc.fetch_balance()
+                if bal is not None and bal>0:
+                    engine_g.agent.balance=bal
+                    engine_g.agent.start_balance=bal
+                    engine_g.agent.pnl_curve=[bal]
+                    engine_g.log(f"API baglandi | Bakiye: ${bal:,.2f}","success")
+                    msg="ok"
+                else:
+                    engine_g.log(f"API hatasi: {engine_g.bc.api_error}","error")
+                    msg=engine_g.bc.api_error or "error"
+                self.send_response(200)
+                self.send_header('Content-type','application/json')
+                self.send_header('Access-Control-Allow-Origin','*')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status':msg,'balance':bal}).encode())
+        except Exception as e:
+            print(f"POST err: {e}")
+
     def do_GET(self):
         try:
             if self.path=='/':
